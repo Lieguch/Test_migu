@@ -88,22 +88,30 @@ jobs:
               || echo "[optional] skipped: $p"
           done
           echo "ccache: $(ccache --version | head -1)"
-          # ROOT-CAUSE FIX (run 38112476192): AOSP-9 prebuilt clang (clang-4691093)
-          # links against libtinfo.so.5 / libncurses.so.5; ubuntu-22.04 ships only
-          # .so.6. Create compatibility symlinks so the prebuilt clang can run.
-          # Verified solution (tm23forest.com, CSDN u014078003, lynxbee — all for
-          # AOSP-9 on ubuntu 20.04+/22.04).
-          for lib in libtinfo.so.5 libncurses.so.5; do
-            base="${lib%.5}"
-            target="/usr/lib/x86_64-linux-gnu/${base}6"
-            link="/usr/lib/x86_64-linux-gnu/$lib"
-            if [ -f "$target" ] && [ ! -e "$link" ]; then
-              sudo ln -sf "$target" "$link"
-              echo "[compat] linked $lib -> ${base}6"
-            elif [ -e "$link" ]; then
-              echo "[compat] $lib already exists"
+          # ROOT-CAUSE FIX (runs 38112476192 / 38113353914): AOSP-9 prebuilt clang
+          # (clang-4691093) links against libtinfo.so.5; ubuntu-22.04 ships only .so.6.
+          # First attempt (symlink .so.6 -> .so.5) FAILED: /usr/lib/x86_64-linux-gnu/
+          # has NO libtinfo.so6 at all (only libtinfo.so.6.3 via libtinfo.so.6 SONAME
+          # inside libncurses*). Correct fix: install the real legacy runtime package
+          # libtinfo5 (= ncurses 6.3-2ubuntu0.3, jammy universe) which ships
+          # /lib/x86_64-linux-gnu/libtinfo.so.5 directly.
+          # Evidence: ubuntuupdates.org/core/jammy/.../libtinfo5 (jammy universe 6.3-2ubuntu0.3).
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y -qq --no-install-recommends libtinfo5 \
+            || echo "[compat] WARNING: libtinfo5 not installable (universe disabled?)"
+          # Belt-and-braces: if the package is unavailable, symlink from the real
+          # SONAME path libtinfo.so.6 (a symlink installed by libncurses6) instead of
+          # guessing a non-existent libtinfo.so6.
+          for pair in "libtinfo.so.5:libtinfo.so.6" "libncurses.so.5:libncurses.so.6"; do
+            link="${pair%%:*}"; src="${pair##*:}"
+            lpath="/usr/lib/x86_64-linux-gnu/$link"
+            spath="/usr/lib/x86_64-linux-gnu/$src"
+            if [ ! -e "$lpath" ] && [ -e "$spath" ]; then
+              sudo ln -sf "$spath" "$lpath"
+              echo "[compat] linked $link -> $src"
+            elif [ -e "$lpath" ]; then
+              echo "[compat] $link present"
             else
-              echo "[compat] WARNING: $target not found — $lib not created"
+              echo "[compat] WARNING: neither $link nor $src present"
             fi
           done
 

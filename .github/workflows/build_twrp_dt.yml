@@ -1,0 +1,75 @@
+name: Build TWRP Device Tree (P817 / RK3288W)
+
+# P817 (Rockchip RK3288W, Android 4.4 kiosk) — touchscreen TWRP recovery project.
+# Goal: generate a TWRP device tree from the stock recovery.img so a flashable,
+# touch-driven TWRP can later be compiled (stage 2). This workflow = stage 1.
+#
+# NOTE on image format: Rockchip recovery.img is an "rkimage" (RK header + embedded
+# standard Android boot image). twrpdtgen only understands the standard Android boot
+# image (magic "ANDROID!" at offset 0), so we locate the embedded boot image inside
+# the RK wrapper and feed THAT to twrpdtgen.
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check Out
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip cpio wget zip git
+          python3 -m pip install --upgrade pip
+          python3 -m pip install twrpdtgen
+
+      - name: Extract embedded boot image (RK rkimage -> standard boot)
+        run: |
+          python3 - <<'PY'
+          import sys
+          src = 'recovery.img'
+          data = open(src, 'rb').read()
+          i = data.find(b'ANDROID!')
+          if i < 0:
+              # Fallback: common 4 MiB Rockchip header
+              i = 4194304
+              if len(data) <= i:
+                  sys.stderr.write("ERROR: no ANDROID! magic and file too small\n")
+                  sys.exit(2)
+          open('boot.img', 'wb').write(data[i:])
+          sys.stderr.write("extracted boot.img from offset %d, size %d\n" % (i, len(data) - i))
+          PY
+
+      - name: Generate TWRP device tree
+        run: python3 -m twrpdtgen -o dt/ boot.img
+
+      - name: Package DeviceTree
+        run: zip -r DeviceTree.zip ./dt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TWRP_DeviceTree_P817
+          path: DeviceTree.zip
+
+      - name: Publish Release (best-effort)
+        uses: softprops/action-gh-release@v2
+        continue-on-error: true
+        with:
+          files: DeviceTree.zip
+          name: TWRP_Device_Tree-${{ github.run_id }}
+          tag_name: dt-${{ github.run_id }}
+          body: |
+            TWRP device tree for P817 (RK3288W), generated from stock recovery.img via twrpdtgen.
+            This is the STAGE-1 artifact (device tree config). A flashable TWRP recovery.img
+            still requires STAGE-2: compiling TWRP source with this tree + the prebuilt kernel/dtb.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

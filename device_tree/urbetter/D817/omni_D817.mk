@@ -1,14 +1,16 @@
 #
-# Copyright (C) 2026 The Android Open Source Project
-# Copyright (C) 2026 SebaUbuntu's TWRP device tree generator
-#
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 — omni-9.0 compatible product definition for urbetter/D817
+# Reworked from twrpdtgen output: the generated file inherited
+#   vendor/omni/config/common.mk + full_base_telephony and set 16.1-era props
+# that do not exist in the Android-9.0 build tree. This version follows the
+# canonical omni twrp-9.0 pattern: core_32_bit + base + vendor/omni common + device.
 #
 
 # Inherit from those products. Most specific first.
-$(call inherit-product, $(SRC_TARGET_DIR)/product/full_base_telephony.mk)
+$(call inherit-product, $(SRC_TARGET_DIR)/product/core_32_bit.mk)
+$(call inherit-product, $(SRC_TARGET_DIR)/product/base.mk)
 
-# Inherit some common Omni stuff.
+# Inherit some common Omni (TWRP) stuff.
 $(call inherit-product, vendor/omni/config/common.mk)
 
 # Inherit from D817 device
@@ -20,9 +22,7 @@ PRODUCT_BRAND := urbetter
 PRODUCT_MODEL := P817
 PRODUCT_MANUFACTURER := urbetter
 
-PRODUCT_GMS_CLIENTID_BASE := android-urbetter
-
-PRODUCT_BUILD_PROP_OVERRIDES += \
-    PRIVATE_BUILD_DESC="rk3288-userdebug 4.4.4 KTU84Q eng.xierong.20180307.164546 test-keys"
-
-BUILD_FINGERPRINT := urbetter/rk3288/rk3288:4.4.4/KTU84Q/eng.xierong.20180307.164546:userdebug/test-keys
+# Android 9-era props only (no 16.x inventables like PLATFORM_VERSION)
+PRODUCT_PROPERTY_OVERRIDES += \
+    ro.product.name=D817 \
+    ro.build.characteristics=tablet

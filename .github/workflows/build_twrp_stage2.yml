@@ -1,0 +1,191 @@
+name: Stage-2 TWRP build (urbetter D817 / RK3288W)
+
+# ---------------------------------------------------------------------------
+# Stage-2: compile a flashable TWRP recovery.img for urbetter/D817 (P817).
+# Source: omni minimal-manifest twrp-9.0  ->  TWRP 3.3.1
+#
+# Why twrp-9.0 (decided 2026-10-11, evidenced in P817_STAGE2_report.md):
+#   * twrp-12.1 emits mkbootimg header v4 + boots via skip_ramdisk/init::second
+#     flags the 2017 Rockchip bootROM-bootloader does not understand; also
+#     KILLS vold/RIL daemons via Android-11 prebuilt kill_arg (SIGKILL -> recovery
+#     stderr spam on an rk30board 4.4 device). 32-bit-only target + FDE=unsupported
+#     add more risk. REJECTED.
+#   * OFRP sync script v031 (2026-09-28) dropped the 11.0 manifest. REJECTED.
+#   * twrp-9.0: TWRP 3.3.1, boots via classic init= ramdisk (identical to stock
+#     integration), emits header v0 byte-identical layout to stock:
+#     ANDROID! @0x400000 (4MB zero page) + base 0x60400000 + ramdisk @0x62000000
+#     + tags @0x60088000 + appended DTB prebuilt kernel 6791568B.
+#
+# Remaining obstacles the runner handles:
+#   * omni-9.0 needs OpenJDK 8  (setup-java zulu 8)
+#   * omni-9.0 needs python2.7  (ubuntu-22.04 apt has none; deadsnakes has no
+#     jammy build -> compile 2.7.18 from source with gcc-10, pinned SHA256)
+#
+# Build host: GitHub-hosted public runner (4 vCPU / 16G RAM / ~14G SSD /
+# 6h job cap, free unlimited minutes for public repos). 12G swap for image builds.
+#
+# Repository layout: device tree is versioned under device_tree/urbetter/D817
+# (see Stage-1). This workflow copies it into the sync tree as
+# device/urbetter/D817 (RedirectBranch unchanged for subsequent checkouts).
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build_twrp_stage2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write      # release upload
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350   # stay under the public-repo 6h job cap
+
+    steps:
+      - name: Check Out
+        uses: actions/checkout@v4
+
+      - name: Cleanup The Actions Workspace
+        uses: rokibhasansagar/slimhub_actions@main
+
+      - name: Environment Recon (resource + reachability probe)
+        run: |
+          echo "== nproc =="; nproc
+          echo "== mem =="; free -h
+          echo "== disk =="; df -h / /tmp /mnt | head -6
+          echo "== resident toolchain =="; (gcc --version | head -1); (python3 --version)
+          echo "== outbound probes =="
+          for u in https://android.googlesource.com https://github.com https://git.omnirom.org; do
+            code=$(curl -s -o /dev/null -m 15 -w '%{http_code}' "$u" || echo FAIL)
+            echo "$u -> $code"
+          done
+
+      - name: Install OpenJDK 8 (required by omni-9.0/AOSP-9 build)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '8'
+          default: true   # omni-9.0 build system executes `java`/`javac`; must resolve to JDK 8
+
+      - name: Host build dependencies (AOSP-9 toolchain set)
+        run: |
+          sudo apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y -qq --no-install-recommends \
+            git-core gnupg flex bison gperf build-essential zip curl zlib1g-dev \
+            gcc-multilib g++-multilib libc6-dev-i386 lib32ncurses5-dev lib32z1-dev \
+            x11proto-core-dev libx11-dev libgl1-mesa-dev libxml2-utils xsltproc \
+            unzip bc python3 python-is-python3 ccache lzop rsync \
+            gcc-10 g++-10 libssl-dev libbz2-dev libffi-dev libreadline-dev libsqlite3-dev liblzma-dev
+          sudo update-alternatives --install /usr/bin/python python /usr/bin/python3 1 || true
+          echo "ccache: $(ccache --version | head -1)"
+
+      - name: Recover python2.7 (omni-9.0 is a python2 build system)
+        run: |
+          # ubuntu-22.04 removed python2.7 from apt; deadsnakes has no jammy binary.
+          # Compile CPython 2.7.18 from the official source tarball.
+          # SHA-256 pinned to the python.org-released archive:
+          #   da3080e3b488f648a3d7a4560ddee895284c3380b11d6de75edb986526b9a814
+          cd /tmp
+          curl -fsSL -o Python-2.7.18.tgz https://www.python.org/ftp/python/2.7.18/Python-2.7.18.tgz
+          echo "da3080e3b488f648a3d7a4560ddee895284c3380b11d6de75edb986526b9a814  Python-2.7.18.tgz" | sha256sum -c -
+          tar xzf Python-2.7.18.tgz
+          cd Python-2.7.18
+          CC=gcc-10 ./configure --prefix=/opt/py27 --enable-shared --without-ensurepip
+          make -j$(nproc)
+          sudo make install
+          sudo ln -sf /opt/py27/bin/python2.7 /usr/local/bin/python2
+          sudo ln -sf /opt/py27/bin/python2.7 /usr/local/bin/python   # AOSP-9 scripts call `python`
+          echo "PATH=/opt/py27/bin:$PATH" >> "$GITHUB_ENV"
+          /opt/py27/bin/python2.7 --version
+
+      - name: Install repo
+        run: |
+          mkdir -p ~/bin
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Initialize omni-9.0 TWRP source
+        run: |
+          mkdir -p workspace
+          cd workspace
+          git config --global user.name "cnb-actions"
+          git config --global user.email "actions@localhost"
+          repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_omni.git -b twrp-9.0
+          echo "workspace-folder=$(pwd)" >> "$GITHUB_OUTPUT"
+        id: pwd
+
+      - name: Repo Sync (trimmed minimal manifest)
+        run: |
+          cd ${{ steps.pwd.outputs.workspace-folder }}
+          for attempt in 1 2 3; do
+            echo "== repo sync attempt $attempt =="
+            if repo sync -c --force-sync -j$(nproc --all); then break; fi
+            echo "== retry after 10s =="; sleep 10
+          done
+          df -h . | tail -2
+
+      - name: Place D817 device tree
+        run: |
+          cd ${{ steps.pwd.outputs.workspace-folder }}
+          mkdir -p device/urbetter
+          cp -a "$GITHUB_WORKSPACE/device_tree/urbetter/D817" device/urbetter/
+          ls -la device/urbetter/D817
+
+      - name: Set Swap Space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 12
+
+      - name: Building recovery (TWRP 3.3.1)
+        run: |
+          cd ${{ steps.pwd.outputs.workspace-folder }}
+          source build/envsetup.sh
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export USE_CCACHE=1
+          lunch omni_D817-eng && mka adbd recoveryimage -j$(nproc --all)
+
+      - name: Verify built recovery image (structural self-check)
+        run: |
+          cd ${{ steps.pwd.outputs.workspace-folder }}
+          OUT=out/target/product/D817
+          ls -la "$OUT" | head -20
+          REC="$OUT/recovery.img"
+          echo "== sha256 =="; sha256sum "$REC"
+          echo "== size =="; stat -c%s "$REC"
+          python3 - "$REC" <<'PY'
+          import struct, sys
+          d = open(sys.argv[1], 'rb').read()
+          i = d.find(b'ANDROID!')
+          print('ANDROID! @', hex(i))
+          def u32(o): return struct.unpack_from('<I', d, i+o)[0]
+          print('kernel_size =', u32(8), 'kernel_addr =', hex(u32(12)))
+          print('ramdisk_size =', u32(16), 'ramdisk_addr =', hex(u32(20)))
+          print('tags_addr =', hex(u32(32)), 'page_size =', u32(36), 'dt_size =', u32(40))
+          print('header version =', u32(44) if len(d) > i+48 else 'n/a')
+          assert i == 0x400000, 'RK 4MB page offset NOT preserved!'
+          assert u32(36) == 16384, 'page size drifted'
+          assert u32(12) == 0x60408000 and u32(20) == 0x62000000, 'addr contract drifted'
+          print('STRUCTURE OK: matches stock byte contract')
+          PY
+          echo "== TWRP marker strings =="
+          strings "$REC" | grep -ci 'twrp' || true
+
+      - name: Publish Release (best-effort)
+        uses: softprops/action-gh-release@v2
+        continue-on-error: true
+        with:
+          files: |
+            ${{ steps.pwd.outputs.workspace-folder }}/out/target/product/D817/recovery.img
+          name: TWRP-3.3.1-D817-stage2-${{ github.run_id }}
+          tag_name: stage2-${{ github.run_id }}
+          body: |
+            Stage-2 TWRP (3.3.1 / omni-9.0) recovery.img for urbetter/D817 (P817, RK3288W).
+            Flash per §9.5 discipline: only the `recovery` partition via device-side `dd`.
+            Source alias: device_tree/urbetter/D817 (device tree) + omni twrp-9.0 minimal manifest.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

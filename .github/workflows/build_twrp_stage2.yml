@@ -196,6 +196,21 @@ jobs:
           export USE_CCACHE=1
           lunch omni_D817-eng && mka adbd recoveryimage -j$(nproc --all)
 
+      - name: Prepend RK 4MB zero page (match stock boot layout)
+        run: |
+          cd ${{ steps.pwd.outputs.workspace-folder }}
+          OUT=out/target/product/D817
+          REC="$OUT/recovery.img"
+          # AOSP mkbootimg emits ANDROID! @0x0; RK3288W bootloader reads the
+          # header at partition offset 0x400000 (4MB). Stock recovery.img
+          # confirms: first 4MB is pure zeros (verified locally — no RK magic,
+          # no idbloader, just zeros), ANDROID! @0x400000. This is the RK
+          # "mkimage.sh" convention: the bootloader skips the first 4MB.
+          echo "== before prepend =="; stat -c%s "$REC"
+          dd if=/dev/zero bs=4194304 count=1 | cat - "$REC" > "$REC.rk"
+          mv "$REC.rk" "$REC"
+          echo "== after prepend =="; stat -c%s "$REC"
+
       - name: Verify built recovery image (structural self-check)
         run: |
           cd ${{ steps.pwd.outputs.workspace-folder }}
@@ -217,6 +232,7 @@ jobs:
           assert i == 0x400000, 'RK 4MB page offset NOT preserved!'
           assert u32(36) == 16384, 'page size drifted'
           assert u32(12) == 0x60408000 and u32(20) == 0x62000000, 'addr contract drifted'
+          assert u32(32) == 0x60088000, 'tags_addr contract drifted'
           print('STRUCTURE OK: matches stock byte contract')
           PY
           echo "== TWRP marker strings =="

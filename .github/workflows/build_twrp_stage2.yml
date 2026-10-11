@@ -34,6 +34,7 @@ on:
     branches: [ main ]
     paths:
       - '.github/workflows/build_twrp_stage2.yml'
+      - 'device_tree/**'
   workflow_dispatch:
 
 permissions:

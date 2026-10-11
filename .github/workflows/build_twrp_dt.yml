@@ -1,13 +1,18 @@
 name: Build TWRP Device Tree (P817 / RK3288W)
 
-# P817 (Rockchip RK3288W, Android 4.4 kiosk) — touchscreen TWRP recovery project.
+# P817 (Rockchip RK3288W, Android 4.4 KitKat kiosk) — touchscreen TWRP recovery project.
 # Goal: generate a TWRP device tree from the stock recovery.img so a flashable,
 # touch-driven TWRP can later be compiled (stage 2). This workflow = stage 1.
 #
-# NOTE on image format: Rockchip recovery.img is an "rkimage" (RK header + embedded
-# standard Android boot image). twrpdtgen only understands the standard Android boot
-# image (magic "ANDROID!" at offset 0), so we locate the embedded boot image inside
-# the RK wrapper and feed THAT to twrpdtgen.
+# Image-format notes (both are required for this old device):
+#  1) Rockchip recovery.img is an "rkimage" (RK header + embedded standard Android
+#     boot image). twrpdtgen only understands the standard boot image (magic
+#     "ANDROID!" at offset 0), so we locate the embedded boot image inside the RK
+#     wrapper and extract it.
+#  2) twrpdtgen 3.x reads the Treble-era property `ro.system.product.cpu.abilist`
+#     from the ramdisk build.prop. Android 4.4 (KitKat) recovery only has
+#     `ro.product.cpu.abi`, so twrpdtgen crashes. We inject the missing property
+#     into the ramdisk's default.prop/build.prop before running twrpdtgen.
 
 on:
   push:
@@ -31,25 +36,68 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install twrpdtgen
 
-      - name: Extract embedded boot image (RK rkimage -> standard boot)
+      - name: Extract + patch boot image (RK->boot, inject CPU abilist for KitKat)
         run: |
           python3 - <<'PY'
-          import sys
-          src = 'recovery.img'
-          data = open(src, 'rb').read()
+          import struct, os, subprocess, gzip
+          data = open('recovery.img', 'rb').read()
           i = data.find(b'ANDROID!')
           if i < 0:
-              # Fallback: common 4 MiB Rockchip header
               i = 4194304
               if len(data) <= i:
-                  sys.stderr.write("ERROR: no ANDROID! magic and file too small\n")
-                  sys.exit(2)
-          open('boot.img', 'wb').write(data[i:])
-          sys.stderr.write("extracted boot.img from offset %d, size %d\n" % (i, len(data) - i))
+                  raise SystemExit('no ANDROID! magic and file too small')
+          page_size = struct.unpack_from('<I', data, i + 36)[0]
+          if page_size not in (1024, 2048, 4096, 8192, 16384, 65536):
+              page_size = 2048
+          def u32(o): return struct.unpack_from('<I', data, i + o)[0]
+          def align(x, p): return ((x + p - 1) // p) * p
+          kernel_size = u32(8); ramdisk_size = u32(16)
+          second_size = u32(24); dt_size = u32(40)
+          off = i + page_size
+          kernel = data[off:off + kernel_size]; off += align(kernel_size, page_size)
+          ramdisk = data[off:off + ramdisk_size]; off += align(ramdisk_size, page_size)
+          second = data[off:off + second_size] if second_size > 0 else b''
+          off += align(second_size, page_size)
+          dt = data[off:off + dt_size] if dt_size > 0 else b''
+          open('kernel.img', 'wb').write(kernel)
+          if dt: open('dt.img', 'wb').write(dt)
+          print('kernel %d ramdisk %d dt %d page %d' % (kernel_size, ramdisk_size, dt_size, page_size))
+          # unpack ramdisk (gzip cpio) -> dir (device nodes/symlinks skipped safely)
+          os.makedirs('rd', exist_ok=True)
+          rd = gzip.decompress(ramdisk) if ramdisk[:2] == b'\x1f\x8b' else ramdisk
+          open('ramdisk_orig.cpio', 'wb').write(rd)
+          subprocess.run('cd rd && cpio -i -d 2>/dev/null', shell=True)
+          # inject the missing Treble-era property so twrpdtgen 3.x is happy
+          for fn in ('default.prop', 'build.prop'):
+              p = 'rd/' + fn
+              c = open(p).read() if os.path.exists(p) else ''
+              if 'ro.system.product.cpu.abilist' not in c:
+                  with open(p, 'a') as f:
+                      f.write('\n# injected for twrpdtgen on Android 4.4 (KitKat)\n')
+                      f.write('ro.system.product.cpu.abilist=armeabi-v7a\n')
+                      f.write('ro.product.cpu.abilist=armeabi-v7a\n')
+                      f.write('ro.product.cpu.abi=armeabi-v7a\n')
+          if not os.path.exists('rd/default.prop') and not os.path.exists('rd/build.prop'):
+              raise SystemExit('ramdisk did not unpack (no prop files)')
+          # repack ramdisk
+          subprocess.run('cd rd && find . -type f -print0 | cpio -0 -o -H newc > ../ramdisk_new.cpio', shell=True, check=True)
+          newrd = gzip.compress(open('ramdisk_new.cpio', 'rb').read(), 9)
+          # repack boot image with updated ramdisk size
+          hdr = bytearray(data[i:i + page_size])
+          struct.pack_into('<I', hdr, 16, len(newrd))
+          newboot = bytearray(hdr)
+          newboot += kernel + b'\x00' * (align(len(kernel), page_size) - len(kernel))
+          newboot += newrd + b'\x00' * (align(len(newrd), page_size) - len(newrd))
+          if second_size > 0:
+              newboot += second + b'\x00' * (align(len(second), page_size) - len(second))
+          if dt_size > 0:
+              newboot += dt + b'\x00' * (align(len(dt), page_size) - len(dt))
+          open('boot_patched.img', 'wb').write(bytes(newboot))
+          print('wrote boot_patched.img size %d' % len(newboot))
           PY
 
       - name: Generate TWRP device tree
-        run: python3 -m twrpdtgen -o dt/ boot.img
+        run: python3 -m twrpdtgen -o dt/ boot_patched.img
 
       - name: Package DeviceTree
         run: zip -r DeviceTree.zip ./dt

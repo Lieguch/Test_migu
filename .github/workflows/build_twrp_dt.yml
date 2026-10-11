@@ -9,10 +9,12 @@ name: Build TWRP Device Tree (P817 / RK3288W)
 #     boot image). twrpdtgen only understands the standard boot image (magic
 #     "ANDROID!" at offset 0), so we locate the embedded boot image inside the RK
 #     wrapper and extract it.
-#  2) twrpdtgen 3.x reads the Treble-era property `ro.system.product.cpu.abilist`
-#     from the ramdisk build.prop. Android 4.4 (KitKat) recovery only has
-#     `ro.product.cpu.abi`, so twrpdtgen crashes. We inject the missing property
-#     into the ramdisk's default.prop/build.prop before running twrpdtgen.
+#  2) twrpdtgen 3.x (sebaubuntu-libs 2.0.0) reads many Treble-era properties
+#     (ro.product.system.device, ro.system.product.cpu.abilist, ro.board.first_api_level,
+#     ro.build.version.security_patch, ...). Android 4.4 (KitKat) recovery only
+#     carries pre-Treble properties, so twrpdtgen aborts. We inject the missing
+#     properties into the ramdisk's build.prop/default.prop (keeping any real values)
+#     so twrpdtgen can generate the tree.
 
 on:
   push:
@@ -36,7 +38,7 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install twrpdtgen
 
-      - name: Extract + patch boot image (RK->boot, inject CPU abilist for KitKat)
+      - name: Extract + patch boot image (RK->boot, inject KitKat props)
         run: |
           python3 - <<'PY'
           import struct, os, subprocess, gzip
@@ -67,16 +69,50 @@ jobs:
           rd = gzip.decompress(ramdisk) if ramdisk[:2] == b'\x1f\x8b' else ramdisk
           open('ramdisk_orig.cpio', 'wb').write(rd)
           subprocess.run('cd rd && cpio -i -d 2>/dev/null', shell=True)
-          # inject the missing Treble-era property so twrpdtgen 3.x is happy
+          # KitKat-compatible property set twrpdtgen 3.x requires (gaps filled).
+          # Real values already present in the ramdisk are preserved.
+          REQUIRED = {
+              'ro.product.device': 'p817',
+              'ro.product.manufacturer': 'unknown',
+              'ro.product.brand': 'Android',
+              'ro.product.model': 'P817',
+              'ro.product.cpu.abilist': 'armeabi-v7a,armeabi',
+              'ro.product.board': 'rk3288',
+              'ro.product.first_api_level': '19',
+              'ro.build.version.security_patch': '2014-01-01',
+              'ro.board.first_api_level': '19',
+              'ro.build.fingerprint': 'Android/rk3288/rk3288:4.4.4/KTU84P/eng:userdebug/release-keys',
+              'ro.build.description': 'rk3288-userdebug 4.4.4 KTU84P eng release-keys',
+              'ro.board.platform': 'rk3288',
+              'ro.sf.lcd_density': '320',
+              'ro.build.characteristics': 'tablet',
+              'ro.build.ab_update': 'false',
+              'ro.boot.dynamic_partitions': 'false',
+              'ro.virtual_ab.enabled': 'false',
+              'ro.build.system_root_image': 'false',
+              'ro.hwui.use_vulkan': 'false',
+              'ro.apex.updatable': 'false',
+          }
+          def load_props(path):
+              d = {}
+              if os.path.exists(path):
+                  for line in open(path):
+                      line = line.strip()
+                      if line and not line.startswith('#') and '=' in line:
+                          k, v = line.split('=', 1); d[k.strip()] = v.strip()
+              return d
+          def save_props(path, d):
+              with open(path, 'w') as f:
+                  for k, v in d.items():
+                      f.write('%s=%s\n' % (k, v))
           for fn in ('default.prop', 'build.prop'):
               p = 'rd/' + fn
-              c = open(p).read() if os.path.exists(p) else ''
-              if 'ro.system.product.cpu.abilist' not in c:
-                  with open(p, 'a') as f:
-                      f.write('\n# injected for twrpdtgen on Android 4.4 (KitKat)\n')
-                      f.write('ro.system.product.cpu.abilist=armeabi-v7a\n')
-                      f.write('ro.product.cpu.abilist=armeabi-v7a\n')
-                      f.write('ro.product.cpu.abi=armeabi-v7a\n')
+              d = load_props(p)
+              for k, v in REQUIRED.items():
+                  if k not in d:
+                      d[k] = v
+              save_props(p, d)
+              print('wrote', p, '(%d props)' % len(d))
           if not os.path.exists('rd/default.prop') and not os.path.exists('rd/build.prop'):
               raise SystemExit('ramdisk did not unpack (no prop files)')
           # repack ramdisk

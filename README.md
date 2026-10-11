@@ -7,6 +7,7 @@
 ## 仓库内容
 - `recovery.img` —— P817 原厂 recovery（32MB，已取证：内核 built-in Goodix 触屏驱动）。
 - `.github/workflows/build_twrp_dt.yml` —— GitHub Actions 工作流，从 `recovery.img` 生成 TWRP 设备树。
+- `device_tree/urbetter/D817/` —— **Stage-1 产物已版本化存档**（twrpdtgen 生成的 TWRP 设备树，`dt/urbetter/D817/` 原样落盘；真实机型身份 = `urbetter/D817`）。Stage-2 编译直接 pull 此目录。
 
 ## 构建（Stage 1：设备树）
 推送到 `main` 或手动 `workflow_dispatch` 即触发。工作流会：
@@ -19,7 +20,7 @@
 ## 重要说明（两阶段）
 - **本仓库产出的是 Stage-1 设备树**，不是可直接 `dd` 刷入的 TWRP recovery.img。
 - **Stage-2** 仍需：用本设备树 + 预编译内核/dtb（取自原厂 recovery）编译 TWRP 源码，
-  产出真正可刷的 `twrp.img`。该步为重构建（需 TWRP/OmniROM 源码 + 预编译内核），待排期。
+  产出真正可刷的 `twrp.img`。该步为重构建（需 TWRP/OmniROM 源码 + 预编译内核），在 **CNB 云开发（cnb.cool 远程 Linux）** 执行中。
 
 ## 刷写与回退红线
 - 只动 `recovery` 分区（`dd` 写）；严禁动 uboot / parameter / boot / resource。

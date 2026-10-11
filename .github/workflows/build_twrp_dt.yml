@@ -26,6 +26,9 @@ name: Build TWRP Device Tree (P817 / RK3288W)
 on:
   push:
     branches: [ main ]
+    paths:
+      - 'recovery.img'
+      - '.github/workflows/build_twrp_dt.yml'
   workflow_dispatch:
 
 permissions:

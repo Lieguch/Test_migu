@@ -88,6 +88,24 @@ jobs:
               || echo "[optional] skipped: $p"
           done
           echo "ccache: $(ccache --version | head -1)"
+          # ROOT-CAUSE FIX (run 38112476192): AOSP-9 prebuilt clang (clang-4691093)
+          # links against libtinfo.so.5 / libncurses.so.5; ubuntu-22.04 ships only
+          # .so.6. Create compatibility symlinks so the prebuilt clang can run.
+          # Verified solution (tm23forest.com, CSDN u014078003, lynxbee — all for
+          # AOSP-9 on ubuntu 20.04+/22.04).
+          for lib in libtinfo.so.5 libncurses.so.5; do
+            base="${lib%.5}"
+            target="/usr/lib/x86_64-linux-gnu/${base}6"
+            link="/usr/lib/x86_64-linux-gnu/$lib"
+            if [ -f "$target" ] && [ ! -e "$link" ]; then
+              sudo ln -sf "$target" "$link"
+              echo "[compat] linked $lib -> ${base}6"
+            elif [ -e "$link" ]; then
+              echo "[compat] $lib already exists"
+            else
+              echo "[compat] WARNING: $target not found — $lib not created"
+            fi
+          done
 
       - name: Recover python2.7 (omni-9.0 is a python2 build system)
         run: |

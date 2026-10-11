@@ -9,12 +9,19 @@ name: Build TWRP Device Tree (P817 / RK3288W)
 #     boot image). twrpdtgen only understands the standard boot image (magic
 #     "ANDROID!" at offset 0), so we locate the embedded boot image inside the RK
 #     wrapper and extract it.
-#  2) twrpdtgen 3.x (sebaubuntu-libs 2.0.0) reads many Treble-era properties
-#     (ro.product.system.device, ro.system.product.cpu.abilist, ro.board.first_api_level,
-#     ro.build.version.security_patch, ...). Android 4.4 (KitKat) recovery only
-#     carries pre-Treble properties, so twrpdtgen aborts. We inject the missing
-#     properties into the ramdisk's build.prop/default.prop (keeping any real values)
-#     so twrpdtgen can generate the tree.
+#  2) twrpdtgen 3.x (sebaubuntu-libs) reads many Treble-era properties that
+#     Android 4.4 recovery never carried, so we inject the missing properties into
+#     the ramdisk's default.prop (keeping any real values) so twrpdtgen can proceed.
+#  3) The stock ramdisk carries its fstab at etc/recovery.fstab, which is exactly
+#     the only path twrpdtgen scans for — so we must preserve it (extract correctly).
+#
+# Hard-won lessons baked into this file:
+#  * twrpdtgen's AIKManager only runs on Linux (the GitHub runner is fine; local
+#    Windows is not). Do NOT try to run twrpdtgen on a Windows dev box.
+#  * `cpio -i -d` reads the archive from STDIN. You MUST feed it the archive with
+#    `-I file` (or `< file`). Running `cpio -i -d` with no input silently extracts
+#    NOTHING, leaving an empty ramdisk dir and a fstab-less repack -> twrpdtgen
+#    aborts with "fstab not found". This was the cause of earlier failures.
 
 on:
   push:
@@ -36,12 +43,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y python3 python3-pip cpio wget zip git
           python3 -m pip install --upgrade pip
-          python3 -m pip install twrpdtgen
+          # Pin the exact combo validated locally (twrpdtgen 3.0.0 + sebaubuntu-libs 1.6.1).
+          # Both share identical FSTAB_LOCATIONS / BUILDPROP_LOCATIONS logic.
+          python3 -m pip install "twrpdtgen==3.0.0" "sebaubuntu-libs==1.6.1"
 
       - name: Extract + patch boot image (RK->boot, inject KitKat props)
         run: |
           python3 - <<'PY'
-          import struct, os, subprocess, gzip
+          import struct, os, subprocess, gzip, zlib
           data = open('recovery.img', 'rb').read()
           i = data.find(b'ANDROID!')
           if i < 0:
@@ -68,9 +77,14 @@ jobs:
           os.makedirs('rd', exist_ok=True)
           rd = gzip.decompress(ramdisk) if ramdisk[:2] == b'\x1f\x8b' else ramdisk
           open('ramdisk_orig.cpio', 'wb').write(rd)
-          subprocess.run('cd rd && cpio -i -d 2>/dev/null', shell=True)
-          # KitKat-compatible property set twrpdtgen 3.x requires (gaps filled).
-          # Real values already present in the ramdisk are preserved.
+          # CRITICAL: feed the archive via -I, and check the exit code.
+          subprocess.run('cd rd && cpio -i -d -I ../ramdisk_orig.cpio', shell=True, check=True)
+          # Sanity: confirm fstab + default.prop made it into the extracted tree.
+          have_fstab = os.path.exists('rd/etc/recovery.fstab')
+          have_defprop = os.path.exists('rd/default.prop')
+          print('extracted: etc/recovery.fstab=%s default.prop=%s' % (have_fstab, have_defprop))
+          if not have_fstab:
+              raise SystemExit('fstab missing after cpio extract (extraction broken)')
           REQUIRED = {
               'ro.product.device': 'p817',
               'ro.product.manufacturer': 'unknown',
@@ -105,18 +119,19 @@ jobs:
               with open(path, 'w') as f:
                   for k, v in d.items():
                       f.write('%s=%s\n' % (k, v))
-          for fn in ('default.prop', 'build.prop'):
+          # default.prop is the only prop file twrpdtgen scans that exists in this ramdisk.
+          for fn in ('default.prop', 'prop.default'):
               p = 'rd/' + fn
+              if not os.path.exists(p):
+                  continue
               d = load_props(p)
               for k, v in REQUIRED.items():
                   if k not in d:
                       d[k] = v
               save_props(p, d)
               print('wrote', p, '(%d props)' % len(d))
-          if not os.path.exists('rd/default.prop') and not os.path.exists('rd/build.prop'):
-              raise SystemExit('ramdisk did not unpack (no prop files)')
-          # repack ramdisk
-          subprocess.run('cd rd && find . -type f -print0 | cpio -0 -o -H newc > ../ramdisk_new.cpio', shell=True, check=True)
+          # repack ramdisk, preserving full tree incl. etc/recovery.fstab
+          subprocess.run('cd rd && find . -print0 | cpio -0 -o -H newc -O ../ramdisk_new.cpio', shell=True, check=True)
           newrd = gzip.compress(open('ramdisk_new.cpio', 'rb').read(), 9)
           # repack boot image with updated ramdisk size
           hdr = bytearray(data[i:i + page_size])

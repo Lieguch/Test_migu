@@ -47,13 +47,18 @@ BOARD_KERNEL_BASE := 0x60400000
 BOARD_KERNEL_PAGESIZE := 16384
 BOARD_RAMDISK_OFFSET := 0x01c00000          # -> 0x62000000 == stock ramdisk_addr
 BOARD_KERNEL_TAGS_OFFSET := -0x378000          # NEGATIVE offset: base 0x60400000 + (-0x378000) = 0x60088000 == stock tags_addr
-# NOTE: AIK/unpackbootimg.c prints this as 0xffc88000 (32-bit two's-complement of -0x378000),
-#       but mkbootimg (python, arbitrary precision) treats 0xffc88000 as a POSITIVE int,
-#       giving base+offset = 0x160088000 > uint32 -> struct.error: 'I' format requires 0 <= number <= 4294967295.
-#       mkbootimg's parse_int() does accept the '-0x...' literal, so write the offset as a negative number.
+# NOTE 1 (value): AIK's unpackbootimg.c prints tags_off as C printf("%08x", -0x378000) => 0xffc88000
+#       (32-bit two's complement). Writing that literal makes mkbootimg (python bignum) compute
+#       base + 0xffc88000 = 0x160088000 > uint32 -> struct.error: 'I' format requires 0 <= number <= 4294967295
+#       (CI run 38113353914). Fixed by writing the negative value directly.
+# NOTE 2 (argparse): AOSP-9 mkbootimg uses argparse, whose negative-number heuristic
+#       (^-\d+$|^-\d*\.\d+$) does NOT match '-0x378000' (no decimal digits after '-'),
+#       so '--tags_offset -0x378000' is rejected: 'argument --tags_offset: expected one
+#       argument' (CI run 38125924872). Using the '=' form (--tags_offset=-0x378000) bypasses
+#       the heuristic entirely. BOARD_MKBOOTIMG_ARGS is expanded verbatim by build/make/core/Makefile:782.
 BOARD_KERNEL_IMAGE_NAME := Image            # cosmetic; prebuilt kernel is forced
 BOARD_MKBOOTIMG_ARGS += --ramdisk_offset $(BOARD_RAMDISK_OFFSET)
-BOARD_MKBOOTIMG_ARGS += --tags_offset $(BOARD_KERNEL_TAGS_OFFSET)
+BOARD_MKBOOTIMG_ARGS += --tags_offset=$(BOARD_KERNEL_TAGS_OFFSET)
 
 # Kernel — prebuilt (do NOT compile; TARGET_FORCE_PREBUILT_KERNEL wipes kernel source deps)
 TARGET_FORCE_PREBUILT_KERNEL := true

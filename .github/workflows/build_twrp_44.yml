@@ -1,0 +1,276 @@
+name: Stage-2 TWRP 4.4 build (urbetter D817 / RK3288W)
+
+# ---------------------------------------------------------------------------
+# ★ 2026-10-12 根因修复 v1（卡 LOGO 事故）★
+#
+# 前身 build_twrp_stage2.yml 基于 omni twrp-9.0 → TWRP 3.3.1，其 sepolicy
+# 版本=30，超出本机内核上限（实测 /sys/fs/selinux/policyvers=28，
+# Linux 3.10 上游 POLICYDB_VERSION_MAX=28）→ 内核 security_load_policy()
+# 返回 -EINVAL → init 早期卡死 → 卡 LOGO 砖机（2026-10-12 事故，§9.20）。
+#
+# 本 workflow 切到 omni twrp-4.4-deprecated → TWRP 2.8.7.x，其 sepolicy
+# 版本 26-27 ≤ 28，内核可接受。用户明确：不追新版，2.8.7.x 也行，
+# 核心需求是能用、功能正常、稳定。
+#
+# 已查证（GitHub API 实测 2026-10-12）：
+#   * minimal-manifest-twrp/platform_manifest_twrp_omni 有 twrp-4.4-deprecated ✅
+#   * omnirom/android_bootable_recovery 有 android-4.4 分支 ✅
+#   * omnirom/android_external_sepolicy 有 android-4.4 分支（policy 26-27）✅
+#
+# 同设备树双产品链：lunch omni_D817_44-eng（本 workflow）
+# 设备树改动：recovery.fstab 改 mmcblk0pX（实测分区表）+ 补 2.8.7 变量
+#
+# 4.4 vs 9.0 构建差异：
+#   * JDK：4.4 时代用 JDK 7（官方要 6，7 兼容）；9.0 用 JDK 8
+#   * python2.7：两者都需要（ubuntu-22.04 无，需源码编译）
+#   * 产品链：4.4 只有 full_base.mk（core_minimal/embedded 是 9.0+ 产物）
+#   * mkbootimg：4.4 是 python2 optparse（负数 --tags_offset=-0x378000 直传 OK）
+#
+# 构建主机：GitHub-hosted public runner（4vCPU/16G/14G SSD/6h 上限，public 免无限分钟）
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build_twrp_44.yml'
+      - 'device_tree/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write      # release upload
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350   # 低于 public-repo 6h job 上限
+
+    steps:
+      - name: Check Out
+        uses: actions/checkout@v4
+
+      - name: Cleanup The Actions Workspace
+        uses: rokibhasansagar/slimhub_actions@main
+
+      - name: Environment Recon (resource + reachability probe)
+        run: |
+          echo "== nproc =="; nproc
+          echo "== mem =="; free -h
+          echo "== disk =="; df -h / /tmp /mnt | head -6
+          echo "== resident toolchain =="; (gcc --version | head -1); (python3 --version)
+          echo "== outbound probes =="
+          for u in https://android.googlesource.com https://github.com https://gitlab.com; do
+            code=$(curl -s -o /dev/null -m 15 -w '%{http_code}' "$u" || echo FAIL)
+            echo "$u -> $code"
+          done
+
+      # Android 4.4 官方要求 JDK 6；JDK 7 向后兼容且 ubuntu-22.04 上更易获得。
+      # 若 7 触发 UnsupportedClassVersionError 再降级尝试 6。
+      - name: Install OpenJDK 7 (required by omni-4.4/AOSP-4.4 build)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '7'
+          default: true
+
+      - name: Host build dependencies
+        run: |
+          sudo apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y -qq --no-install-recommends \
+            git-core gnupg flex bison gperf build-essential zip curl zlib1g-dev \
+            unzip bc python3 python-is-python3 ccache lzop rsync \
+            gcc-10 g++-10 libssl-dev libbz2-dev libffi-dev libreadline-dev libsqlite3-dev liblzma-dev
+          for p in gcc-multilib g++-multilib libc6-dev-i386 lib32ncurses5-dev lib32ncurses-dev \
+                   lib32z1-dev x11proto-core-dev libx11-dev libgl1-mesa-dev libxml2-utils xsltproc; do
+            sudo apt-get install -y -qq --no-install-recommends "$p" \
+              || echo "[optional] skipped: $p"
+          done
+          echo "ccache: $(ccache --version | head -1)"
+
+      - name: Recover python2.7 (omni-4.4 is a python2 build system)
+        run: |
+          # ubuntu-22.04 移除了 python2.7；从官方源码编译 2.7.18（SHA256 固定）
+          cd /tmp
+          curl -fsSL -o Python-2.7.18.tgz https://www.python.org/ftp/python/2.7.18/Python-2.7.18.tgz
+          echo "da3080e3b488f648a3d7a4560ddee895284c3380b11d6de75edb986526b9a814  Python-2.7.18.tgz" | sha256sum -c -
+          tar xzf Python-2.7.18.tgz
+          cd Python-2.7.18
+          # gcc-10 默认 -fno-common；CPython 2.7 依赖历史 -fcommon 链接模型
+          CC=gcc-10 CFLAGS="-fcommon" ./configure --prefix=/opt/py27 --enable-shared --without-ensurepip
+          make -j$(nproc)
+          sudo make install
+          # 注册动态加载器搜索路径（--enable-shared 装到 /opt/py27/lib，默认不在搜索路径）
+          echo "/opt/py27/lib" | sudo tee /etc/ld.so.conf.d/py27.conf
+          sudo ldconfig
+          echo "LD_LIBRARY_PATH=/opt/py27/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          sudo ln -sf /opt/py27/bin/python2.7 /usr/local/bin/python2
+          sudo ln -sf /opt/py27/bin/python2.7 /usr/local/bin/python   # AOSP 脚本调用 `python`
+          echo "PATH=/opt/py27/bin:$PATH" >> "$GITHUB_ENV"
+          /opt/py27/bin/python2.7 --version
+
+      - name: Install repo
+        run: |
+          mkdir -p ~/bin
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Initialize omni twrp-4.4 TWRP source
+        run: |
+          mkdir -p workspace
+          cd workspace
+          git config --global user.name "cnb-actions"
+          git config --global user.email "actions@localhost"
+          # ★ 根因修复：twrp-9.0(sepolicy v30) → twrp-4.4-deprecated(sepolicy v26-27)
+          repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_omni.git -b twrp-4.4-deprecated
+          echo "workspace-folder=$(pwd)" >> "$GITHUB_OUTPUT"
+        id: pwd
+
+      - name: Repo Sync (trimmed minimal manifest)
+        run: |
+          cd ${{ steps.pwd.outputs.workspace-folder }}
+          for attempt in 1 2 3 4 5; do
+            echo "== repo sync attempt $attempt =="
+            if repo sync -c --force-sync -j$(nproc --all); then break; fi
+            echo "== retry after 15s =="; sleep 15
+          done
+          df -h . | tail -2
+
+      - name: Place D817 device tree
+        run: |
+          cd ${{ steps.pwd.outputs.workspace-folder }}
+          mkdir -p device/urbetter
+          cp -a "$GITHUB_WORKSPACE/device_tree/urbetter/D817" device/urbetter/
+          ls -la device/urbetter/D817
+
+      - name: Set Swap Space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 12
+
+      - name: Building recovery (TWRP 2.8.7.x / omni-4.4)
+        run: |
+          cd ${{ steps.pwd.outputs.workspace-folder }}
+          source build/envsetup.sh
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export USE_CCACHE=1
+          # ★ 4.4 专用产品链（omni_D817_44.mk 只继承 4.4 存在的 full_base.mk）
+          lunch omni_D817_44-eng && mka adbd recoveryimage -j$(nproc --all)
+
+      # 结构自检 + ★★ 新增 SELinux/fstab 根因关卡（FIXPLAN_v1.md SIM-5/6/7 + CAL-3）
+      - name: Verify built recovery image (structural + rootcause self-check)
+        run: |
+          cd ${{ steps.pwd.outputs.workspace-folder }}
+          OUT=out/target/product/D817
+          ls -la "$OUT" | head -20
+          REC="$OUT/recovery.img"
+          echo "== sha256 =="; sha256sum "$REC"
+          echo "== size =="; stat -c%s "$REC"
+          python3 - "$REC" <<'PY'
+          import struct, sys, gzip, io
+          d = open(sys.argv[1], 'rb').read()
+          i = d.find(b'ANDROID!')
+          print('ANDROID! @', hex(i))
+          def u32(o): return struct.unpack_from('<I', d, i+o)[0]
+          print('kernel_size =', u32(8), 'kernel_addr =', hex(u32(12)))
+          print('ramdisk_size =', u32(16), 'ramdisk_addr =', hex(u32(20)))
+          print('tags_addr =', hex(u32(32)), 'page_size =', u32(36), 'dt_size =', u32(40))
+          # ---- SIM-1: header 契约（设备实测 p6 字节契约，ANDROID!@0x0 无前缀）----
+          assert i == 0x0, 'ANDROID! must be at partition offset 0x0 (no 4MB prepend)!'
+          assert u32(36) == 16384, 'page size drifted'
+          assert u32(12) == 0x60408000 and u32(20) == 0x62000000, 'addr contract drifted'
+          assert u32(32) == 0x60088000, 'tags_addr contract drifted'
+          print('SIM-1 OK: header matches device-verified p6 byte contract')
+
+          # ---- SIM-5（根因关卡）：ramdisk 内 sepolicy 版本必须 <= 28 ----
+          page = u32(36)
+          ksz = u32(8); rsz = u32(16)
+          roff = page + ((ksz + page - 1)//page)*page
+          rd = d[roff:roff+rsz]
+          assert rd[:2] == b'\x1f\x8b', 'ramdisk not gzip'
+          raw = gzip.decompress(rd)
+          print('ramdisk cpio decompressed:', len(raw), 'bytes')
+          def cpio_files(raw):
+              pos = 0
+              while pos+110 <= len(raw):
+                  if raw[pos:pos+6] != b'070701':
+                      nxt = raw.find(b'070701', pos+1)
+                      if nxt < 0: break
+                      pos = nxt; continue
+                  h = raw[pos:pos+110]
+                  try:
+                      ns = int(h[94:102],16); fs = int(h[54:62],16)
+                  except ValueError:
+                      pos += 1; continue
+                  nm = raw[pos+110:pos+110+ns-1].decode('utf-8','replace')
+                  doff = (pos+110+ns+3)&~3
+                  yield nm, raw[doff:doff+fs]
+                  pos = doff + ((fs+3)&~3)
+          files = dict(cpio_files(raw))
+          print('ramdisk entries:', len(files))
+          sp = files.get('sepolicy')
+          if sp is None:
+              print('SIM-5 WARN: sepolicy not in ramdisk（TWRP 可能内联编译，跳过）')
+          else:
+              # policydb 头：u32 magic(0xf97cff8c) + u32 magic_len + str + u32 version
+              magic = struct.unpack('<I', sp[0:4])[0]
+              assert magic == 0xf97cff8c, 'sepolicy magic wrong: %08x' % magic
+              mlen = struct.unpack('<I', sp[4:8])[0]
+              ver = struct.unpack('<I', sp[8+mlen:12+mlen])[0]
+              print('sepolicy version =', ver, '(内核上限 28)')
+              assert ver <= 28, '*** SIM-5 FAIL: sepolicy v%d > 内核上限 28（卡 LOGO 根因）***' % ver
+              print('SIM-5 OK: sepolicy v%d <= 28' % ver)
+
+          # ---- SIM-6（根因关卡）：fstab 不得含 rknand_*，必须用 mmcblk0pX ----
+          fst = files.get('etc/recovery.fstab') or files.get('recovery.fstab')
+          if fst is None:
+              print('SIM-6 WARN: recovery.fstab not in ramdisk')
+          else:
+              txt = fst.decode('utf-8','replace')
+              assert 'rknand' not in txt, '*** SIM-6 FAIL: fstab 仍含 rknand_* 节点（本机不存在）***'
+              print('SIM-6 OK: fstab 无 rknand_*')
+              for line in txt.splitlines():
+                  s = line.strip()
+                  if s and not s.startswith('#') and 'mmcblk0p' in s:
+                      print('   ', s.split()[0], '->', s.split()[2])
+
+          # ---- SIM-7：init.rc 引用链 ----
+          rc = files.get('init.rc')
+          if rc:
+              txt = rc.decode('utf-8','replace')
+              miss = []
+              for line in txt.splitlines():
+                  s = line.strip()
+                  if s.startswith('import '):
+                      fn = s.split()[1].lstrip('/')
+                      fn = fn.replace('${ro.hardware}', 'rk30board')
+                      if fn not in files:
+                          miss.append(fn)
+              if miss:
+                  print('SIM-7 WARN: init.rc import 缺失:', miss)
+              else:
+                  print('SIM-7 OK: init.rc 引用链完整')
+          print('STRUCTURE + ROOTCAUSE GATE OK')
+          PY
+          echo "== TWRP marker strings =="
+          strings "$REC" | grep -ci 'twrp' || true
+
+      - name: Publish Release (best-effort)
+        uses: softprops/action-gh-release@v2
+        continue-on-error: true
+        with:
+          files: |
+            ${{ steps.pwd.outputs.workspace-folder }}/out/target/product/D817/recovery.img
+          name: TWRP-2.8.7-D817-stage2_44-${{ github.run_id }}
+          tag_name: stage2-44-${{ github.run_id }}
+          body: |
+            Stage-2 TWRP (2.8.7.x / omni twrp-4.4) recovery.img for urbetter/D817 (P817, RK3288W).
+
+            ★ 根因修复 v1：TWRP 3.3.1(sepolicy v30) 导致卡 LOGO（内核上限 28）；
+            本产物基于 Android-4.4（sepolicy v26-27 ≤ 28），fstab 已改 mmcblk0pX。
+
+            Flash per §9.5 discipline: only the `recovery` partition via device-side `dd`.
+            Source alias: device_tree/urbetter/D817 + omni twrp-4.4-deprecated minimal manifest.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

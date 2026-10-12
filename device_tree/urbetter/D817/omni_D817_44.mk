@@ -30,20 +30,11 @@ PRODUCT_PROPERTY_OVERRIDES += \
     ro.product.name=D817 \
     ro.build.characteristics=tablet
 
-# ★ run#6 真因修复（2026-10-12，全部有上游源码 + 日志实证）：
-# omni-4.4 的 mkbootimg 是 **C 程序**（TeamWin/android_system_core
-# android-4.4 分支 mkbootimg/mkbootimg.c），参数解析为空格分隔的 strcmp 链：
-#   while(argc>0){ arg=argv[0]; val=argv[1]; argc-=2; argv+=2;
-#     ... else if(!strcmp(arg,"--tags_offset")) tags_offset=strtoul(val,0,16);
-#     else return usage(); }
-# 等号形式 `--tags_offset=-0x378000` 整体作为一个 arg，不匹配任何 strcmp
-# → else 分支 → usage() 退出 → make Error 1（run#6 死在 boot.img；
-# build/core/Makefile:809 的 recovery.img 规则同样传 BOARD_MKBOOTIMG_ARGS，
-# 一样会死，recovery.img 全程未被构建）。
-# BoardConfig.mk 的 = 形式是给 9.0 链（python argparse，negative-number
-# heuristic 要求 = 形式）用的；本产品覆盖为空格形式。
-# 负值安全性（已核算）：strtoul("-0x378000",0,16) → 32 位 unsigned 0xFFC88000；
-# hdr.tags_addr = 0x60400000 + 0xFFC88000 mod 2^32 = 0x60088000 = 设备实测契约。
-BOARD_MKBOOTIMG_ARGS := \
-    --ramdisk_offset $(BOARD_RAMDISK_OFFSET) \
-    --tags_offset $(BOARD_KERNEL_TAGS_OFFSET)
+# ★ 不要重复（2026-10-12 run#6/#7 双败实证）：BOARD_MKBOOTIMG_ARGS **不能在本产品
+# mk 里修**。AOSP 4.4 的读取顺序是 build/core/envsetup.mk:115 product_config.mk
+# （产品 mk）**先于** build/core/config.mk:155 BoardConfig.mk——本文件里的
+# `BOARD_MKBOOTIMG_ARGS := ...` 执行时 BOARD_RAMDISK_OFFSET/BOARD_KERNEL_TAGS_OFFSET
+# 尚未定义（空），展开为 `--ramdisk_offset  --tags_offset `，随后 BoardConfig.mk 的
+# `+=` 把 9.0 的等号形式 `--tags_offset=-0x378000` 追加到后面 → mkbootimg 收到
+# 未识别参数 → usage() → boot.img Error 1。
+# 正确修法在 BoardConfig.mk（读本文件之后、TARGET_PRODUCT 已可用，按产品分支）。

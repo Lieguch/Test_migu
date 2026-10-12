@@ -1,17 +1,26 @@
-/mnt/internal_sd     vfat     /dev/block/rknand_user               flags=display=internal_sd
-/mnt/external_sd     vfat     /dev/block/mmcblk0p1                 flags=display=external_sd
-/system              ext4     /dev/block/rknand_system             flags=display=system
-/cache               ext4     /dev/block/rknand_cache              flags=display=cache
-/metadata            ext4     /dev/block/rknand_metadata           flags=display=metadata
-/data                ext4     /dev/block/rknand_userdata           flags=display=data
-/cust                ext4     /dev/block/rknand_cust               flags=display=cust
-/custom              ext4     /dev/block/rknand_custom             flags=display=custom
-/radical_update      ext4     /dev/block/rknand_radical_update     flags=display=radical_update
-/misc                mtd      misc                                 flags=display=misc
-/uboot               mtd      uboot                                flags=display=uboot
-/charge              mtd      charge                               flags=display=charge
-/resource            mtd      resource                             flags=display=resource
-/parameter           mtd      parameter                            flags=display=parameter
-/boot                mtd      boot                                 flags=display=boot
-/recovery            mtd      recovery                             flags=display=recovery
-/backup              mtd      backup                               flags=display=backup
+# recovery.fstab — urbetter/D817 (P817, RK3288W)
+# ★ 2026-10-12 根因修复 v1：原版全部使用 /dev/block/rknand_* 节点，
+#   但本机实测 /dev/block/ 下【只有】mmcblk0/mmcblk0p1..p14/mmcblk1(+p1,p2)，
+#   不存在任何 rknand_* 节点 → 挂载必然全败。
+#   分区号来自真机 /proc/partitions 实测（见 FIXPLAN_v1.md 表）。
+#
+# 格式兼容 TWRP 2.8.7.x（omni twrp-4.4）与 TWRP 3.x：
+#   <mount_point>  <type>  <device>  <flags>
+
+# --- 可读写文件系统 ---
+/system           ext4   /dev/block/mmcblk0p10   flags=display=system
+/cache            ext4   /dev/block/mmcblk0p8    flags=display=cache
+/metadata         ext4   /dev/block/mmcblk0p11   flags=display=metadata
+/data             ext4   /dev/block/mmcblk0p14   flags=display=data
+/radical_update   ext4   /dev/block/mmcblk0p12   flags=display=radical_update
+
+# --- 只读/镜像分区（emmc 类型，TWRP 用于备份/还原，不挂载） ---
+/boot             emmc   /dev/block/mmcblk0p5    flags=display=boot
+/recovery         emmc   /dev/block/mmcblk0p6    flags=display=recovery
+/backup           emmc   /dev/block/mmcblk0p7    flags=display=backup
+/kpanic           emmc   /dev/block/mmcblk0p9    flags=display=kpanic
+/system2          emmc   /dev/block/mmcblk0p13   flags=display=system2
+
+# --- 可移动存储 ---
+/mnt/external_sd  vfat   /dev/block/mmcblk1p1    flags=display=external_sd;removable
+/mnt/usbstorage   vfat   /dev/block/sda1         flags=display=usb;removable

@@ -171,6 +171,18 @@ jobs:
           sed -i "s#grep '\^java #grep -E '^(java|openjdk) #g" build/core/main.mk
           echo "--- patched line ---"
           grep -n "openjdk) \.\*" build/core/main.mk || echo "!! sed 未命中"
+          # ★ run#4 根因：宿主 gcc(>=10) 默认 -fno-common，而 AOSP-4.4
+          # external/checkpolicy/checkpolicy.h:16 在头文件内直接定义全局变量
+          # te_assertions → checkpolicy.o / policy_parse.o / policy_define.o
+          # 链接时 multiple definition（run#4 日志行 7115-7127）。
+          # 修法：只给 HOST_GLOBAL_CFLAGS 追加 -fcommon（已核实 omnirom android_build
+          # android-4.4 的 core/combo/HOST_linux-x86.mk 全部用 += 追加，追加安全）；
+          # 只影响宿主侧工具编译，设备侧走 prebuilts gcc 4.x 不受影响。
+          echo "== checkpolicy.h:16 evidence =="
+          sed -n '10,20p' external/checkpolicy/checkpolicy.h || true
+          printf '\n# run#5 fix: restore -fcommon for host tools (host gcc>=10 defaults to -fno-common)\nHOST_GLOBAL_CFLAGS += -fcommon\n' >> build/core/combo/HOST_linux-x86.mk
+          echo "--- HOST_linux-x86.mk tail ---"
+          tail -3 build/core/combo/HOST_linux-x86.mk
           source build/envsetup.sh
           export ALLOW_MISSING_DEPENDENCIES=true
           export USE_CCACHE=1

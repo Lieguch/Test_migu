@@ -51,11 +51,15 @@ BOARD_KERNEL_TAGS_OFFSET := -0x378000          # NEGATIVE offset: base 0x6040000
 #       (32-bit two's complement). Writing that literal makes mkbootimg (python bignum) compute
 #       base + 0xffc88000 = 0x160088000 > uint32 -> struct.error: 'I' format requires 0 <= number <= 4294967295
 #       (CI run 38113353914). Fixed by writing the negative value directly.
-# NOTE 2 (argparse): AOSP-9 mkbootimg uses argparse, whose negative-number heuristic
+# NOTE 2 (argparse, 仅适用 9.0 链): AOSP-9 mkbootimg uses argparse, whose negative-number heuristic
 #       (^-\d+$|^-\d*\.\d+$) does NOT match '-0x378000' (no decimal digits after '-'),
 #       so '--tags_offset -0x378000' is rejected: 'argument --tags_offset: expected one
 #       argument' (CI run 38125924872). Using the '=' form (--tags_offset=-0x378000) bypasses
 #       the heuristic entirely. BOARD_MKBOOTIMG_ARGS is expanded verbatim by build/make/core/Makefile:782.
+#       ⚠️ 纠错（2026-10-12 run#6 实证）：本文件的 = 形式**只对 9.0 成立**。omni-4.4 树的
+#       mkbootimg 是 C 程序（TeamWin/android_system_core android-4.4 mkbootimg/mkbootimg.c），
+#       只认空格分隔形式；等号形式落入 else -> usage() 退出 -> boot.img/recovery.img Error 1。
+#       4.4 产品链在 omni_D817_44.mk 中把 BOARD_MKBOOTIMG_ARGS 覆盖为空格形式。
 BOARD_KERNEL_IMAGE_NAME := Image            # cosmetic; prebuilt kernel is forced
 BOARD_MKBOOTIMG_ARGS += --ramdisk_offset $(BOARD_RAMDISK_OFFSET)
 BOARD_MKBOOTIMG_ARGS += --tags_offset=$(BOARD_KERNEL_TAGS_OFFSET)

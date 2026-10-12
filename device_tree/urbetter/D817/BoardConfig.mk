@@ -93,3 +93,19 @@ TW_USE_TOOLBOX := true
 TW_EXCLUDE_SUPERSU := true
 TW_DEFAULT_LANGUAGE := zh_CN
 TW_NO_LEGACY_PROPS := false
+
+# ---------------------------------------------------------------------------
+# 2026-10-12 根因修复 v1：omni twrp-4.4 / TWRP 2.8.7.x 兼容层
+# 主根因：TWRP 3.3.1 的 sepolicy 版本=30 超出本机内核上限 28（实测
+# /sys/fs/selinux/policyvers=28），内核 security_load_policy() 返回 -EINVAL
+# → init 早期卡死 → 卡 LOGO。Android-4.4 基础的 TWRP 2.8.7.x 的 sepolicy
+# 版本为 26-27 ≤ 28，可被内核接受。以下变量只在 4.4/2.8.7 构建中生效，
+# 在 9.0/3.3.1 构建中为未使用变量（忽略），两条链互不影响。
+# ---------------------------------------------------------------------------
+# TWRP 2.8.7 用 DEVICE_RESOLUTION 而非 TW_THEME（后者 3.x 才有）
+DEVICE_RESOLUTION := 1920x1200
+# omni-4.4 用 RECOVERY_VARIANT 指定编译 TWRP（而非 CM/AOSP recovery）
+RECOVERY_VARIANT := twrp
+# 2.8.7 时代的兼容项
+TW_INCLUDE_BUSYBOX := true
+TW_NO_BATT_PERCENT := false

@@ -13,8 +13,10 @@ name: Stage-2 TWRP build (urbetter D817 / RK3288W)
 #   * OFRP sync script v031 (2026-09-28) dropped the 11.0 manifest. REJECTED.
 #   * twrp-9.0: TWRP 3.3.1, boots via classic init= ramdisk (identical to stock
 #     integration), emits header v0 byte-identical layout to stock:
-#     ANDROID! @0x400000 (4MB zero page) + base 0x60400000 + ramdisk @0x62000000
-#     + tags @0x60088000 + appended DTB prebuilt kernel 6791568B.
+#     ANDROID! @0x0 (device-verified p6 contract, 2026-10-12 Stage-3B; the old
+#     "@0x400000 + 4MB zero page" was misread PARM-vs-physical gap) +
+#     base 0x60400000 + ramdisk @0x62000000 + tags @0x60088000 +
+#     appended DTB prebuilt kernel 6791568B.
 #
 # Remaining obstacles the runner handles:
 #   * omni-9.0 needs OpenJDK 8  (setup-java zulu 8)
@@ -196,21 +198,13 @@ jobs:
           export USE_CCACHE=1
           lunch omni_D817-eng && mka adbd recoveryimage -j$(nproc --all)
 
-      - name: Prepend RK 4MB zero page (match stock boot layout)
-        run: |
-          cd ${{ steps.pwd.outputs.workspace-folder }}
-          OUT=out/target/product/D817
-          REC="$OUT/recovery.img"
-          # AOSP mkbootimg emits ANDROID! @0x0; RK3288W bootloader reads the
-          # header at partition offset 0x400000 (4MB). Stock recovery.img
-          # confirms: first 4MB is pure zeros (verified locally — no RK magic,
-          # no idbloader, just zeros), ANDROID! @0x400000. This is the RK
-          # "mkimage.sh" convention: the bootloader skips the first 4MB.
-          echo "== before prepend =="; stat -c%s "$REC"
-          dd if=/dev/zero bs=4194304 count=1 | cat - "$REC" > "$REC.rk"
-          mv "$REC.rk" "$REC"
-          echo "== after prepend =="; stat -c%s "$REC"
-
+      # 2026-10-12 Stage-3B 设备在线取证修正 (replaces old 4MB prepend):
+      # 设备真实 recovery 分区 (mmcblk0p6, 物理 LBA=172032) 起点就是 ANDROID!@0x0。
+      # 旧的 "Prepend RK 4MB zero page" 是基于误读的 gap 数据做出的错误修复 --
+      # 老备份 recovery.img 里的 4MB 零页其实是 PARM 逻辑地址(recovery@0x28000)
+      # 与 eMMC 物理 LBA 之间统一 +0x2000 扇区(=4MB)间隙的内容, 不是分区内容。
+      # 14 个分区全部满足 kern_start = PARM_start + 0x2000 扇区 (verify_layout.py 实跑)。
+      # 因此 AOSP mkbootimg 的原味输出 (ANDROID!@0) 就是正确契约, 无需任何前缀处理。
       - name: Verify built recovery image (structural self-check)
         run: |
           cd ${{ steps.pwd.outputs.workspace-folder }}
@@ -229,11 +223,15 @@ jobs:
           print('ramdisk_size =', u32(16), 'ramdisk_addr =', hex(u32(20)))
           print('tags_addr =', hex(u32(32)), 'page_size =', u32(36), 'dt_size =', u32(40))
           print('header version =', u32(44) if len(d) > i+48 else 'n/a')
-          assert i == 0x400000, 'RK 4MB page offset NOT preserved!'
+          # 2026-10-12 Stage-3B 设备在线取证修正: 真实 recovery 分区(p6, 物理 LBA=172032)
+          # 起点就是 ANDROID!@0。老结论 "ANDROID!@0x400000" 是把 PARM 逻辑地址
+          # (recovery@0x28000) 直接 dd 读到的 4MB gap 误当成分区内容。
+          # 正确契约: ANDROID! @ 0x0, 无 4MB 前缀。
+          assert i == 0x0, 'ANDROID! must be at partition offset 0x0 (no 4MB prepend)!'
           assert u32(36) == 16384, 'page size drifted'
           assert u32(12) == 0x60408000 and u32(20) == 0x62000000, 'addr contract drifted'
           assert u32(32) == 0x60088000, 'tags_addr contract drifted'
-          print('STRUCTURE OK: matches stock byte contract')
+          print('STRUCTURE OK: matches device-verified p6 byte contract (ANDROID!@0x0)')
           PY
           echo "== TWRP marker strings =="
           strings "$REC" | grep -ci 'twrp' || true

@@ -180,9 +180,11 @@ jobs:
           # 只影响宿主侧工具编译，设备侧走 prebuilts gcc 4.x 不受影响。
           echo "== checkpolicy.h:16 evidence =="
           sed -n '10,20p' external/checkpolicy/checkpolicy.h || true
-          printf '\n# run#5 fix: restore -fcommon for host tools (host gcc>=10 defaults to -fno-common)\nHOST_GLOBAL_CFLAGS += -fcommon\n' >> build/core/combo/HOST_linux-x86.mk
+          echo "== ASTWriter.cpp static data() helpers (run#6 根因证据) =="
+          sed -n '57,69p' external/clang/lib/Serialization/ASTWriter.cpp || true
+          printf '\n# run#5 fix: restore -fcommon for host tools (host gcc>=10 defaults to -fno-common)\nHOST_GLOBAL_CFLAGS += -fcommon\n# run#6 fix: 宿主 gcc-11 默认 gnu++17，使 std::data 经 ADL 进入候选集并抢走\n# ASTWriter.cpp 顶部 static StringRef data() 的唯一匹配（llvm 3 参数 StringRef 版）\n# -> ASTWriter.cpp:1387 multiple definition 风格 no matching function 错误。\n# 压回 gnu++11：libstdc++ 的 std::data 有 __cplusplus>=201402L guard，gnu++11 下\n# 不可见，static data() 恢复唯一候选。设备侧 prebuilts gcc 4.x 不受影响。\nHOST_GLOBAL_CFLAGS += -std=gnu++11\n' >> build/core/combo/HOST_linux-x86.mk
           echo "--- HOST_linux-x86.mk tail ---"
-          tail -3 build/core/combo/HOST_linux-x86.mk
+          tail -4 build/core/combo/HOST_linux-x86.mk
           source build/envsetup.sh
           export ALLOW_MISSING_DEPENDENCIES=true
           export USE_CCACHE=1

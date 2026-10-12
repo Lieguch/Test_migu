@@ -152,6 +152,13 @@ jobs:
       - name: Building recovery (TWRP 2.8.7.x / omni-4.4)
         run: |
           cd ${{ steps.pwd.outputs.workspace-folder }}
+          # ★ OpenJDK 7 的 `java -version` 首行以 "openjdk version ..." 开头，
+          # 而 omni-4.4 build/core/main.mk:155 的锚点是 `^java .*` -> 匹配失败
+          # 触发 `$(error stop)`（run#2 失败真因）。仅放宽该锚点，其余版本检查保留。
+          grep -n "grep '\^java " build/core/main.mk || true
+          sed -i "s#grep '\^java #grep -E '^(java|openjdk) #g" build/core/main.mk
+          echo "--- patched line ---"
+          grep -n "openjdk) \.\*" build/core/main.mk || echo "!! sed 未命中"
           source build/envsetup.sh
           export ALLOW_MISSING_DEPENDENCIES=true
           export USE_CCACHE=1

@@ -56,13 +56,34 @@ BOARD_KERNEL_TAGS_OFFSET := -0x378000          # NEGATIVE offset: base 0x6040000
 #       so '--tags_offset -0x378000' is rejected: 'argument --tags_offset: expected one
 #       argument' (CI run 38125924872). Using the '=' form (--tags_offset=-0x378000) bypasses
 #       the heuristic entirely. BOARD_MKBOOTIMG_ARGS is expanded verbatim by build/make/core/Makefile:782.
-#       ⚠️ 纠错（2026-10-12 run#6 实证）：本文件的 = 形式**只对 9.0 成立**。omni-4.4 树的
+#       ⚠️ 纠错（2026-10-12 run#6/#7 实证）：本文件的 = 形式**只对 9.0 成立**。omni-4.4 树的
 #       mkbootimg 是 C 程序（TeamWin/android_system_core android-4.4 mkbootimg/mkbootimg.c），
 #       只认空格分隔形式；等号形式落入 else -> usage() 退出 -> boot.img/recovery.img Error 1。
-#       4.4 产品链在 omni_D817_44.mk 中把 BOARD_MKBOOTIMG_ARGS 覆盖为空格形式。
+#       且**不能**在 omni_D817_44.mk 里覆盖（产品 mk 先于本文件被读取，见下方修复段）；
+#       4.4 链的修法是本文件下方按 TARGET_PRODUCT 分支输出空格形式。
 BOARD_KERNEL_IMAGE_NAME := Image            # cosmetic; prebuilt kernel is forced
 BOARD_MKBOOTIMG_ARGS += --ramdisk_offset $(BOARD_RAMDISK_OFFSET)
+# ★ run#6/#7 双败根因与修复（2026-10-12，日志+上游源码实证）：
+# 1. omni-4.4 的 mkbootimg 是 C 程序（TeamWin/android_system_core android-4.4
+#    mkbootimg/mkbootimg.c），空格分隔 strcmp 链解析；`--tags_offset` 选项存在
+#    （mkbootimg.c:153，usage 字符串漏印），只认空格形式。等号形式整体作为一个
+#    arg 不匹配任何 strcmp → else 分支 usage() 退出 → boot.img Error 1。
+# 2. 修复**必须在本文件做**，不能放产品 mk：AOSP 4.4 读取顺序为
+#    build/core/envsetup.mk:115 product_config.mk（产品 mk）**先于**本文件
+#    （config.mk:155）。产品 mk 里 `:=` 覆盖时 BOARD_*_OFFSET 尚为空，且本文件
+#    的 += 之后还会把值追加进去（run#6 等号形式未识别 / run#7 空格+空值+等号
+#    三重错位，两次 usage 退出同一根因）。
+# 3. 本文件被读时 TARGET_PRODUCT 已由 product_config.mk 设置，可按产品分支：
+#    - omni_D817_44（4.4/C mkbootimg）：空格形式
+#    - omni_D817（9.0/python argparse）：= 形式（argparse negative-number
+#      heuristic 要求，见下方 NOTE 2）
+# 负值安全性（已核算）：strtoul("-0x378000",0,16) → 32 位 unsigned 0xFFC88000；
+# hdr.tags_addr = 0x60400000 + 0xFFC88000 mod 2^32 = 0x60088000 = 设备实测契约。
+ifneq ($(filter omni_D817_44,$(TARGET_PRODUCT)),)
+BOARD_MKBOOTIMG_ARGS += --tags_offset $(BOARD_KERNEL_TAGS_OFFSET)
+else
 BOARD_MKBOOTIMG_ARGS += --tags_offset=$(BOARD_KERNEL_TAGS_OFFSET)
+endif
 
 # Kernel — prebuilt (do NOT compile; TARGET_FORCE_PREBUILT_KERNEL wipes kernel source deps)
 TARGET_FORCE_PREBUILT_KERNEL := true

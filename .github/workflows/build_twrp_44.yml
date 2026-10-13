@@ -255,18 +255,41 @@ jobs:
               assert ver <= 28, '*** SIM-5 FAIL: sepolicy v%d > 内核上限 28（卡 LOGO 根因）***' % ver
               print('SIM-5 OK: sepolicy v%d <= 28' % ver)
 
-          # ---- SIM-6（根因关卡）：fstab 不得含 rknand_*，必须用 mmcblk0pX ----
+          # ---- SIM-6（根因关卡）：fstab 挂载设备必须是本机真实存在的块设备 ----
+          # ★ 口径修正（2026-10-13，run#10「假红」根因）：旧版用 `'rknand' not in txt`
+          #   对【整个文件】做朴素子串匹配，把 recovery.fstab 注释头里的修复说明
+          #   （字面提及原厂 Nand 节点名）误判为违规 → run#10 明明构建成功、产物
+          #   正确（SIM-1/SIM-5 全过、fstab 全部 mmcblk0pX）却被本门禁拦截。
+          #   正确口径：只解析真实挂载行（跳过 # 注释与空行），校验其【设备字段】
+          #   是否属于本机实测存在的块设备。禁止再回到全文字符串匹配。
           fst = files.get('etc/recovery.fstab') or files.get('recovery.fstab')
           if fst is None:
               print('SIM-6 WARN: recovery.fstab not in ramdisk')
           else:
               txt = fst.decode('utf-8','replace')
-              assert 'rknand' not in txt, '*** SIM-6 FAIL: fstab 仍含 rknand_* 节点（本机不存在）***'
-              print('SIM-6 OK: fstab 无 rknand_*')
+              print('--- etc/recovery.fstab verbatim ---')
+              print(txt.rstrip())
+              print('--- end recovery.fstab ---')
+              entries = []
               for line in txt.splitlines():
                   s = line.strip()
-                  if s and not s.startswith('#') and 'mmcblk0p' in s:
-                      print('   ', s.split()[0], '->', s.split()[2])
+                  if not s or s.startswith('#'):
+                      continue
+                  parts = s.split()
+                  if len(parts) >= 3:
+                      entries.append(parts)
+              assert entries, '*** SIM-6 FAIL: fstab 无任何有效挂载行 ***'
+              # 本机实测 /dev/block/ 仅含：mmcblk0、mmcblk0p1..p14、mmcblk1(+p1,p2)、sda1
+              ALLOWED = set(['/dev/block/mmcblk0'] +
+                            ['/dev/block/mmcblk0p%d' % i for i in range(1, 15)] +
+                            ['/dev/block/mmcblk1', '/dev/block/mmcblk1p1',
+                             '/dev/block/mmcblk1p2', '/dev/block/sda1'])
+              bad = [p for p in entries if p[2] not in ALLOWED]
+              assert not bad, '*** SIM-6 FAIL: fstab 含本机不存在的块设备: %s ***' % bad
+              print('SIM-6 OK: %d 个挂载行全部使用本机真实设备（mmcblk0pX / mmcblk1 / sda1）'
+                    % len(entries))
+              for p in entries:
+                  print('   %-16s %-6s %s' % (p[0], p[1], p[2]))
 
           # ---- SIM-7：init.rc 引用链 ----
           rc = files.get('init.rc')

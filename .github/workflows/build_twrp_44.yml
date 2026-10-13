@@ -191,6 +191,78 @@ jobs:
           # ★ 4.4 专用产品链（omni_D817_44.mk 只继承 4.4 存在的 full_base.mk）
           lunch omni_D817_44-eng && mka adbd recoveryimage -j$(nproc --all)
 
+      # ★★ 2026-10-13 u-boot 接受层修复（§9.35/§9.36，设备二进制实证）★★
+      # RK u-boot（rkproduct；rk32plat.h RK3288 -> CONFIG_SECUREBOOT_CRYPTO ->
+      # config.h SECUREBOOT_CRYPTO_EN）在 ANDROID! 加载路径调用
+      # SecureNSModeBootImageShaCheck：
+      #   id[0:20] == SHA1(kernel||kernel_size||ramdisk||ramdisk_size||second_size
+      #                    ||tags_addr||page_size||unused||name||cmdline)
+      # 不符 -> SecureBootImageCheck=false -> NS 模式 -> board_fbt_boot_failed("ramdisk")
+      #        -> do_rockusb -> 本机无 USB 数据口 -> 永悬 = 卡 LOGO（内核从未执行）。
+      # 实证：设备 idblock（RC4 解密）含 "boot/recovery image sha mismatch!"；
+      #       run#11 header id=1731e9bc… != 公式值 7e310dda…（即其卡 LOGO 首因）。
+      # AOSP/TeamWin mkbootimg 写的 id 不是该公式 -> 本步骤构建后按公式重算。
+      - name: Fix RK boot header id (u-boot SecureBootImageCheck gate)
+        run: |
+          cd ${{ steps.pwd.outputs.workspace-folder }}
+          OUT=out/target/product/D817
+          python3 - "$OUT/recovery.img" <<'PY'
+          import struct, sys, hashlib, os
+          REC = sys.argv[1]
+          # 原厂 recovery id[0:20]（每日开机 + 对照组实证；本地与设备备份逐字节复算命中）
+          STOCK_ID = bytes.fromhex('7e2d10e8cad2042b1ec7ed3c7af100bcb63970a5')
+          d = bytearray(open(REC, 'rb').read())
+          assert d[:8] == b'ANDROID!', 'ANDROID! magic missing'
+          def u32(o): return struct.unpack_from('<I', d, o)[0]
+          ks, rs, ss, tags, page = u32(8), u32(16), u32(24), u32(32), u32(36)
+          roff = page + ((ks + page - 1)//page)*page
+          def rk_sha1(img, base=0):
+              b = (bytes(img[base+page:base+page+ks]) + struct.pack('<I', ks) +
+                   bytes(img[base+roff:base+roff+rs]) + struct.pack('<I', rs) +
+                   struct.pack('<I', ss) + struct.pack('<I', tags) +
+                   struct.pack('<I', page) + bytes(img[base+40:base+48]) +
+                   bytes(img[base+48:base+64]) + bytes(img[base+64:base+576]))
+              return hashlib.sha1(b).digest()
+          old = bytes(d[576:596]); calc = rk_sha1(d)
+          print('stored id[0:20] =', old.hex())
+          print('RK formula id   =', calc.hex())
+          assert calc != old, '!! mkbootimg 竟已写出 RK 公式 id（异常，需人工复核）'
+          # 负向锚：篡改 ramdisk 1 字节 -> 公式 id 必须变化（证明门禁有牙）
+          bad = bytearray(d); bad[roff] ^= 0xFF
+          assert rk_sha1(bad) != bytes(bad[576:596]), '负向锚失效：篡改未被公式感知'
+          print('负向锚 OK: ramdisk 篡改 1 字节 -> 公式 id 变化（门禁可检测）')
+          # 正向锚：仓内原厂 recovery.img（老 gap 视图，magic@0x400000）按同公式
+          # 必须得到 STOCK_ID（公式理解正确性的一环境内证明）
+          stock = os.path.join(os.environ.get('GITHUB_WORKSPACE', ''), 'recovery.img')
+          if os.path.exists(stock):
+              s = open(stock, 'rb').read()
+              soff = s.find(b'ANDROID!')
+              assert soff >= 0, 'stock ANDROID! missing'
+              sks = struct.unpack_from('<I', s, soff+8)[0]
+              srs = struct.unpack_from('<I', s, soff+16)[0]
+              sss = struct.unpack_from('<I', s, soff+24)[0]
+              stags = struct.unpack_from('<I', s, soff+32)[0]
+              spage = struct.unpack_from('<I', s, soff+36)[0]
+              sroff = soff + spage + ((sks + spage - 1)//spage)*spage
+              sbuf = (s[soff+spage:soff+spage+sks] + struct.pack('<I', sks) +
+                      s[sroff:sroff+srs] + struct.pack('<I', srs) + struct.pack('<I', sss) +
+                      struct.pack('<I', stags) + struct.pack('<I', spage) +
+                      s[soff+40:soff+48] + s[soff+48:soff+64] + s[soff+64:soff+576])
+              sid = hashlib.sha1(sbuf).digest()
+              print('stock formula id =', sid.hex(), '(expect', STOCK_ID.hex() + ')')
+              assert sid == STOCK_ID, '正向锚失效：原厂镜像公式不符——公式理解错误!'
+              print('正向锚 OK: 原厂 recovery.img 公式 id == 设备实测 id')
+          else:
+              print('正向锚 SKIP: 仓内无 recovery.img（仅断言常量，判别力减弱）')
+          # 修复：写入公式 id；id[20:32] 清零（与原厂一致，RK 校验只比前 20 字节）
+          d[576:596] = calc
+          d[596:608] = b'\x00' * 12
+          open(REC, 'wb').write(bytes(d))
+          assert rk_sha1(d) == bytes(d[576:596]), '修复后自校验失败'
+          print('FIXED id[0:20] =', bytes(d[576:596]).hex(), '| id[20:32] zeroed')
+          print('sha256(fixed) =', hashlib.sha256(bytes(d)).hexdigest())
+          PY
+
       # 结构自检 + ★★ 新增 SELinux/fstab 根因关卡（FIXPLAN_v1.md SIM-5/6/7 + CAL-3）
       - name: Verify built recovery image (structural + rootcause self-check)
         run: |
@@ -325,6 +397,9 @@ jobs:
 
             ★ 根因修复 v1：TWRP 3.3.1(sepolicy v30) 导致卡 LOGO（内核上限 28）；
             本产物基于 Android-4.4（sepolicy v26-27 ≤ 28），fstab 已改 mmcblk0pX。
+            ★ 根因修复 v2（2026-10-13）：RK u-boot 镜像接受层校验 header id
+            （id[0:20]==SHA1(kernel‖ks‖ramdisk‖rs‖ss‖tags‖page‖unused‖name‖cmdline)，
+            设备 idblock 二进制实证）；本产物已按公式重算 id 并过双向锚门禁。
 
             Flash per §9.5 discipline: only the `recovery` partition via device-side `dd`.
             Source alias: device_tree/urbetter/D817 + omni twrp-4.4-deprecated minimal manifest.

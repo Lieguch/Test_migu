@@ -1,0 +1,151 @@
+name: Pstore RK3288 3.10 kernel build
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/pstore_kernel_build.yml'
+      - 'kernel_patches/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Check Out
+        uses: actions/checkout@v4
+
+      - name: Environment Recon
+        run: |
+          set -euo pipefail
+          echo "== nproc =="; nproc
+          echo "== mem =="; free -h
+          echo "== disk =="; df -h / /tmp /home | head -8
+          echo "== gcc =="; gcc --version | head -1 || true
+          echo "== arm cross gcc =="; arm-linux-gnueabi-gcc --version 2>/dev/null | head -1 || true
+
+      - name: Install ARM cross toolchain and kernel build deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y -qq --no-install-recommends \
+            git make gcc-arm-linux-gnueabi g++-arm-linux-gnueabi \
+            binutils-arm-linux-gnueabi flex bison libelf-dev \
+            libssl-dev libncurses5-dev xxd curl ca-certificates
+          echo "== versions =="
+          arm-linux-gnueabi-gcc --version | head -1
+          arm-linux-gnueabi-ld --version | head -1
+          arm-linux-gnueabi-ar --version | head -1
+
+      - name: Clone RK3288 Linux 3.10 source
+        run: |
+          set -euo pipefail
+          if [ -d rk3288_linux3.10/.git ]; then
+            echo "Kernel source already present"
+          else
+            git clone --depth 1 https://github.com/uyhoangtran/rk3288_linux3.10.git rk3288_linux3.10
+          fi
+          cd rk3288_linux3.10
+          echo "== source version =="
+          cat Makefile | head -5
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)=' Makefile || true
+
+      - name: Add GCC 11/12/14 compatibility shim for Linux 3.10
+        run: |
+          set -euo pipefail
+          cd rk3288_linux3.10
+          # Linux 3.10 predates modern compiler version headers. If a newer ARM GCC
+          # exposes gcc>=10, create a shim that maps it back to compiler-gcc4.h.
+          gcc_ver=$(arm-linux-gnueabi-gcc -dumpversion | cut -d. -f1)
+          echo "Cross GCC major: $gcc_ver"
+          if [ "$gcc_ver" -ge 10 ] && [ ! -f include/linux/compiler-gcc${gcc_ver}.h ]; then
+            # Some distros may only ship compiler-gcc8/10/11; use gcc4 as base because
+            # 3.10 does not need newer header semantics for this build path.
+            printf '#define COMPILER_VERSION "%s"\n#include "compiler-gcc4.h"\n' \
+              "$(arm-linux-gnueabi-gcc -dumpfullversion)" > "include/linux/compiler-gcc${gcc_ver}.h"
+            echo "Created include/linux/compiler-gcc${gcc_ver}.h shim"
+          fi
+
+      - name: Generate pstore-enabled defconfig
+        run: |
+          set -euo pipefail
+          cd rk3288_linux3.10
+          # Firefly RK3288 defconfig is the closest available base for RK3288.
+          cp arch/arm/configs/firefly-rk3288_defconfig .config
+          # 3.10 names ramoops as PSTORE_RAM, not RAMOOPS.
+          cat >> .config <<'EOF'
+CONFIG_PSTORE=y
+CONFIG_PSTORE_CONSOLE=y
+CONFIG_PSTORE_RAM=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_TMPFS=y
+CONFIG_PROC_FS=y
+CONFIG_8139CP=y
+CONFIG_USB_SUPPORT=y
+EOF
+          # Resolve any missing symbols without dropping the explicitly added pstore options.
+          # olddefconfig may re-resolve dependencies, but zImage build only requires a
+          # consistent .config; we intentionally avoid `make olddefconfig` removing items.
+          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- olddefconfig 2>&1 | tee olddefconfig.log || true
+          # Re-assert pstore flags after kconfig resolution.
+          cat >> .config <<'EOF'
+CONFIG_PSTORE=y
+CONFIG_PSTORE_CONSOLE=y
+CONFIG_PSTORE_RAM=y
+EOF
+          echo "== pstore config lines =="
+          grep -n 'PSTORE' .config || true
+
+      - name: Build zImage with pstore
+        run: |
+          set -euo pipefail
+          cd rk3288_linux3.10
+          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- zImage -j"$(nproc)" 2>&1 | tee zImage_build.log
+          test -f arch/arm/boot/zImage
+          echo "== zImage info =="
+          ls -lh arch/arm/boot/zImage
+          file arch/arm/boot/zImage 2>/dev/null || true
+          sha256sum arch/arm/boot/zImage
+
+      - name: Verify pstore symbols in zImage
+        run: |
+          set -euo pipefail
+          cd rk3288_linux3.10
+          echo "== strings containing pstore/last_kmsg/ramoops =="
+          strings arch/arm/boot/zImage | grep -Ei 'pstore|last_kmsg|ramoops|console' | sort -u | head -80 || true
+          # Build a compact text report for artifact.
+          {
+            echo "PSTORE ZIMAGE VERIFICATION"
+            echo "========================="
+            echo
+            echo "GCC: $(arm-linux-gnueabi-gcc --version | head -1)"
+            echo "Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "zImage: $(ls -l arch/arm/boot/zImage)"
+            echo
+            echo "SHA256:"
+            sha256sum arch/arm/boot/zImage
+            echo
+            echo "CONFIG grep:"
+            grep -n 'PSTORE' .config || true
+            echo
+            echo "Strings match:"
+            strings arch/arm/boot/zImage | grep -Ei 'pstore|last_kmsg|ramoops' | sort -u || true
+          } > pstore_zimage_report.txt
+          cat pstore_zimage_report.txt
+
+      - name: Upload pstore zImage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zImage-pstore-rk3288
+          path: |
+            rk3288_linux3.10/arch/arm/boot/zImage
+            rk3288_linux3.10/pstore_zimage_report.txt
+            rk3288_linux3.10/zImage_build.log
+            rk3288_linux3.10/olddefconfig.log

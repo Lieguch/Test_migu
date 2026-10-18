@@ -85,25 +85,25 @@ jobs:
           # Force =y (built-in) so pstore symbols land directly in zImage; =m would
           # produce a loadable module and leave zImage with no pstore strings.
           cat >> .config <<'EOF'
-CONFIG_PSTORE=y
-CONFIG_PSTORE_CONSOLE=y
-CONFIG_PSTORE_RAM=y
-CONFIG_REED_SOLOMON=m
-CONFIG_DEVTMPFS=y
-CONFIG_DEVTMPFS_MOUNT=y
-CONFIG_TMPFS=y
-CONFIG_PROC_FS=y
-EOF
+          CONFIG_PSTORE=y
+          CONFIG_PSTORE_CONSOLE=y
+          CONFIG_PSTORE_RAM=y
+          CONFIG_REED_SOLOMON=m
+          CONFIG_DEVTMPFS=y
+          CONFIG_DEVTMPFS_MOUNT=y
+          CONFIG_TMPFS=y
+          CONFIG_PROC_FS=y
+          EOF
           # Resolve any missing symbols without dropping the explicitly added pstore options.
           # olddefconfig may re-resolve dependencies, but zImage build only requires a
           # consistent .config; we intentionally avoid `make olddefconfig` removing items.
           make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- olddefconfig 2>&1 | tee olddefconfig.log || true
           # Re-assert pstore flags after kconfig resolution.
           cat >> .config <<'EOF'
-CONFIG_PSTORE=y
-CONFIG_PSTORE_CONSOLE=y
-CONFIG_PSTORE_RAM=y
-EOF
+          CONFIG_PSTORE=y
+          CONFIG_PSTORE_CONSOLE=y
+          CONFIG_PSTORE_RAM=y
+          EOF
           echo "== pstore config lines =="
           grep -n 'PSTORE' .config || true
 

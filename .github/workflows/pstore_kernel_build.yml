@@ -56,20 +56,23 @@ jobs:
           cat Makefile | head -5
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)=' Makefile || true
 
-      - name: Add GCC 11/12/14 compatibility shim for Linux 3.10
+      - name: Add GCC compatibility shim for Linux 3.10
         run: |
           set -euo pipefail
           cd rk3288_linux3.10
-          # Linux 3.10 predates modern compiler version headers. If a newer ARM GCC
-          # exposes gcc>=10, create a shim that maps it back to compiler-gcc4.h.
-          gcc_ver=$(arm-linux-gnueabi-gcc -dumpversion | cut -d. -f1)
-          echo "Cross GCC major: $gcc_ver"
-          if [ "$gcc_ver" -ge 10 ] && [ ! -f include/linux/compiler-gcc${gcc_ver}.h ]; then
-            # Some distros may only ship compiler-gcc8/10/11; use gcc4 as base because
-            # 3.10 does not need newer header semantics for this build path.
-            printf '#define COMPILER_VERSION "%s"\n#include "compiler-gcc4.h"\n' \
-              "$(arm-linux-gnueabi-gcc -dumpfullversion)" > "include/linux/compiler-gcc${gcc_ver}.h"
-            echo "Created include/linux/compiler-gcc${gcc_ver}.h shim"
+          # Linux 3.10 predates compiler-gcc10/11/12 headers. Modern Ubuntu ARM GCC
+          # ships a generic compiler-gcc.h that switches on __GNUC__. For 3.10 the
+          # safest shim maps any modern gcc to compiler-gcc4.h semantics.
+          # Detect the real major without relying on -dumpversion line parsing.
+          gcc_major=$(arm-linux-gnueabi-gcc -dumpversion | cut -d. -f1)
+          echo "Cross GCC major detected: $gcc_major"
+          # Always create the shim header regardless (idempotent, safe) so that
+          # -include linux/compiler-gcc.h resolves to a known-good base.
+          if [ ! -f include/linux/compiler-gcc${gcc_major}.h ]; then
+            printf '#include "compiler-gcc4.h"\n' > "include/linux/compiler-gcc${gcc_major}.h"
+            echo "Created shim include/linux/compiler-gcc${gcc_major}.h -> compiler-gcc4.h"
+          else
+            echo "Shim include/linux/compiler-gcc${gcc_major}.h already exists"
           fi
 
       - name: Generate pstore-enabled defconfig
@@ -79,16 +82,17 @@ jobs:
           # Firefly RK3288 defconfig is the closest available base for RK3288.
           cp arch/arm/configs/firefly-rk3288_defconfig .config
           # 3.10 names ramoops as PSTORE_RAM, not RAMOOPS.
+          # Force =y (built-in) so pstore symbols land directly in zImage; =m would
+          # produce a loadable module and leave zImage with no pstore strings.
           cat >> .config <<'EOF'
 CONFIG_PSTORE=y
 CONFIG_PSTORE_CONSOLE=y
 CONFIG_PSTORE_RAM=y
+CONFIG_REED_SOLOMON=m
 CONFIG_DEVTMPFS=y
 CONFIG_DEVTMPFS_MOUNT=y
 CONFIG_TMPFS=y
 CONFIG_PROC_FS=y
-CONFIG_8139CP=y
-CONFIG_USB_SUPPORT=y
 EOF
           # Resolve any missing symbols without dropping the explicitly added pstore options.
           # olddefconfig may re-resolve dependencies, but zImage build only requires a
@@ -116,29 +120,42 @@ EOF
 
       - name: Verify pstore symbols in zImage
         run: |
-          set -euo pipefail
+          set -uo pipefail
           cd rk3288_linux3.10
-          echo "== strings containing pstore/last_kmsg/ramoops =="
-          strings arch/arm/boot/zImage | grep -Ei 'pstore|last_kmsg|ramoops|console' | sort -u | head -80 || true
-          # Build a compact text report for artifact.
+          echo "== pstore config resolution (from .config) =="
+          grep -E '^CONFIG_PSTORE|^CONFIG_PSTORE_CONSOLE|^CONFIG_PSTORE_RAM' .config || echo "WARN: pstore lines absent in .config"
+          echo
+          echo "== strings matching pstore/last_kmsg/ramoops in zImage =="
+          found=$(strings arch/arm/boot/zImage | grep -Ei 'pstore|last_kmsg|ramoops' | sort -u || true)
+          echo "${found:-<none found in zImage text section>}"
+          echo
+          echo "== pstore .o objects built by kbuild =="
+          ls -lh fs/pstore/*.o 2>/dev/null || echo "no fs/pstore/*.o (modular build)"
+          ls -lh lib/raid/*.o 2>/dev/null | head -5 || true
+          echo
+          echo "== report =="
           {
             echo "PSTORE ZIMAGE VERIFICATION"
             echo "========================="
-            echo
-            echo "GCC: $(arm-linux-gnueabi-gcc --version | head -1)"
+            gcc_full=$(arm-linux-gnueabi-gcc --version 2>/dev/null | head -1 || echo unknown)
+            echo "Cross GCC: $gcc_full"
             echo "Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-            echo "zImage: $(ls -l arch/arm/boot/zImage)"
-            echo
-            echo "SHA256:"
+            ls -lh arch/arm/boot/zImage
             sha256sum arch/arm/boot/zImage
             echo
             echo "CONFIG grep:"
-            grep -n 'PSTORE' .config || true
+            grep -E '^CONFIG_PSTORE' .config || true
             echo
-            echo "Strings match:"
-            strings arch/arm/boot/zImage | grep -Ei 'pstore|last_kmsg|ramoops' | sort -u || true
+            echo "Strings hit in zImage:"
+            echo "$found"
           } > pstore_zimage_report.txt
           cat pstore_zimage_report.txt
+          # 关键门禁：zImage 必须含 pstore 相关符号，否则后续注镜像白做。
+          if [ -z "$found" ]; then
+            echo "GATE FAIL: no pstore symbols in zImage (likely modular build)"
+            exit 1
+          fi
+          echo "GATE PASS: pstore symbols present in zImage"
 
       - name: Upload pstore zImage artifacts
         uses: actions/upload-artifact@v4

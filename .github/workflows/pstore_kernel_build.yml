@@ -41,7 +41,7 @@ jobs:
           DEBIAN_FRONTEND=noninteractive sudo apt-get install -y -qq --no-install-recommends \
             git make gcc-arm-linux-gnueabi g++-arm-linux-gnueabi \
             binutils-arm-linux-gnueabi flex bison libelf-dev \
-            libssl-dev libncurses5-dev xxd curl ca-certificates xz-utils
+            libssl-dev libncurses5-dev xxd curl ca-certificates xz-utils lzop
           echo "== versions =="
           arm-linux-gnueabi-gcc --version | head -1
           arm-linux-gnueabi-ld --version | head -1

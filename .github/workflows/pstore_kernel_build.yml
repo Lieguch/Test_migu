@@ -56,8 +56,19 @@ jobs:
           mkdir -p toolchain
           URL=https://releases.linaro.org/components/toolchain/binaries/4.9-2017.01/arm-linux-gnueabi/gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabi.tar.xz
           MIRROR=https://mirrors.tuna.tsinghua.edu.cn/armbian-releases/_toolchain/gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabi.tar.xz
-          curl -fsSL --retry 3 -o linaro49.tar.xz "$URL" \
-            || curl -fsSL --retry 3 -o linaro49.tar.xz "$MIRROR"
+          # `curl -f` cannot catch a 200 HTML error page; validate the xz magic
+          # bytes (FD 37 7A 58 5A 00) so an HTML body never reaches tar.
+          ok=0
+          for U in "$MIRROR" "$URL"; do
+            echo "trying $U"
+            if curl -fsSL --retry 3 --max-time 900 -o linaro49.tar.xz "$U"; then
+              magic=$(head -c 6 linaro49.tar.xz | od -An -tx1 | tr -d ' \n')
+              echo "  size=$(stat -c%s linaro49.tar.xz) magic=$magic"
+              if [ "$magic" = "fd377a585a00" ]; then ok=1; break; fi
+              echo "  not an xz archive, trying next URL"
+            fi
+          done
+          if [ "$ok" != 1 ]; then echo "FATAL: no valid toolchain archive"; exit 1; fi
           tar Jxf linaro49.tar.xz -C toolchain
           ls -d "$HOME/toolchain/gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabi"
           "$HOME/toolchain/gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabi/bin/arm-linux-gnueabi-gcc" --version | head -1

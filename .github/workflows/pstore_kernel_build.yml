@@ -299,29 +299,34 @@ jobs:
           echo "lzop rc=$lzo_rc"; cat /tmp/lzop.err || true
           test -s /tmp/Image || { echo "FATAL: lzop 没有产出任何数据"; exit 1; }
           echo "解出的 Image 大小: $(stat -c%s /tmp/Image) B"
-          # ① ARM Linux Image 在 0x24 处有魔数 0x016f2818
-          m=$(od -An -tx4 -j36 -N4 /tmp/Image | tr -d ' \n')
-          echo "Image magic @0x24 = 0x$m"
-          test "0$m" = "0x016f2818" || { echo "FATAL: 解出的不是 ARM Image"; exit 1; }
-          # ② 解出的 Image 必须含【本内核】的版本横幅
+          # 判据纪律（run#16 教训，写死在注释里）：判据必须来自【本配置的源码路径】，
+          # 不能拿"通用格式印象"当铁证。已核实的构建链（对 CI 实际 clone 的树
+          # uyhoangtran/rk3288_linux3.10 用 Contents API 实取）：
+          #   arch/arm/boot/Makefile:48-49   Image: vmlinux → objcopy
+          #   arch/arm/boot/Makefile:52      compressed/vmlinux: Image FORCE
+          #   compressed/Makefile:193        piggy.lzo: ../Image FORCE
+          # ⇒ piggy.lzo 就是对本树 arch/arm/boot/Image 的 LZO 压缩。
+          #   最忠实的判据 = 解出的 piggy 与 kbuild 自己产出的 Image 逐字节相同。
+          #   （不要自己拼 objcopy 参数：kbuild 的 OBJCOPYFLAGS 实为
+          #     `-O binary -R .comment -S`，没有 -R .note，照记忆写必假红。）
+          test -f arch/arm/boot/Image || { echo "FATAL: kbuild 未产出 arch/arm/boot/Image"; exit 1; }
+          ls -l /tmp/Image arch/arm/boot/Image
+          # ① 字节级铁证：解出的 piggy 必须与 kbuild 自己产出的 Image 完全相同
+          if cmp -s /tmp/Image arch/arm/boot/Image; then
+            echo "① 逐字节相同 OK —— piggy 解出来正是本树的 Image"
+          else
+            echo "FATAL: 解出的 Image 与 arch/arm/boot/Image 不一致"; exit 1
+          fi
+          # ② 版本横幅：判据来自 CI clone 日志实测的 Makefile
+          #    （VERSION=3 PATCHLEVEL=10 SUBLEVEL=37 EXTRAVERSION=空）
           ver=$(strings /tmp/Image | grep -m1 'Linux version' || true)
           echo "Image 内内核版本串: ${ver:-<none>}"
           test -n "$ver" || { echo "FATAL: 解出的 Image 不含内核版本串"; exit 1; }
+          echo "$ver" | grep -q 'Linux version 3\.10\.37' || { echo "FATAL: 版本串不是本树的 3.10.37"; exit 1; }
           # ③ zImage 必须逐字节携带该 piggy
           python3 -c 'import sys; z=open("arch/arm/boot/zImage","rb").read(); p=open("arch/arm/boot/compressed/piggy.lzo","rb").read(); i=z.find(p); print("piggy 在 zImage 中的偏移:", i, "长度:", len(p)); sys.exit(0 if i >= 0 and z[i:i+len(p)] == p else 1)'
-          # ④ 字节级铁证：解出的 Image 必须与 objcopy 出的 vmlinux 二进制一致
-          "$LINARO"objcopy -O binary -R .note -R .comment -S vmlinux /tmp/vmlinux.bin
-          ls -l /tmp/Image /tmp/vmlinux.bin
-          si=$(stat -c%s /tmp/Image); sv=$(stat -c%s /tmp/vmlinux.bin)
-          echo "Image=$si  vmlinux.bin=$sv"
-          test "$si" = "$sv" || { echo "FATAL: Image 与 vmlinux.bin 大小不一致"; exit 1; }
-          if cmp -s /tmp/Image /tmp/vmlinux.bin; then
-            echo "④ 逐字节相同 OK —— piggy 解出来正是本内核"
-          else
-            echo "FATAL: Image 与 vmlinux.bin 内容不一致"; exit 1
-          fi
-          sha256sum /tmp/Image
-          echo "GATE PASS: piggy 可解压、是 ARM Image、是本内核、且被 zImage 完整携带"
+          sha256sum /tmp/Image arch/arm/boot/Image
+          echo "GATE PASS: piggy 可解压、与本树 Image 逐字节相同、且被 zImage 完整携带"
           echo "NOTE: 本项证明镜像完整性与载荷正确性，不声称它能在板子上启动。"
 
       - name: Upload kernel integrity evidence

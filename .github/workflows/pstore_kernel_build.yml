@@ -134,16 +134,24 @@ jobs:
             >> .config
           echo "== appended block, verbatim (od, to expose any leading space) =="
           tail -n 7 .config | od -c | head -20
+          cp .config config.before
           # Resolve any missing symbols without dropping the explicitly added pstore options.
           # olddefconfig may re-resolve dependencies, but zImage build only requires a
           # consistent .config; we intentionally avoid `make olddefconfig` removing items.
           make ARCH=arm CROSS_COMPILE="$LINARO" HOSTCC="gcc -fcommon" olddefconfig 2>&1 | tee olddefconfig.log || true
-          echo "== pstore in .config =="
+          echo "== diff: .config before vs after olddefconfig (first 80 lines) =="
+          diff config.before .config | head -80 || true
+          echo
+          echo "== every PSTORE mention in .config (unanchored) =="
+          grep -n 'PSTORE' .config || echo "  (no PSTORE string anywhere)"
+          echo "== PSTORE in auto.conf (what kbuild consumes) =="
+          grep -n 'PSTORE' include/config/auto.conf || echo "  (none)"
+          echo "== is the symbol visible to kconfig in this tree? =="
+          grep -rn '^config PSTORE' fs/pstore/Kconfig || echo "  (no config PSTORE in fs/pstore/Kconfig)"
+          ls fs/pstore || true
+          echo "== pstore in .config (anchored gate) =="
           grep -n '^CONFIG_PSTORE' .config || { echo "FATAL: PSTORE dropped from .config"; exit 1; }
-          echo "== pstore in include/config/auto.conf (what kbuild actually consumes) =="
           grep -n '^CONFIG_PSTORE' include/config/auto.conf || { echo "FATAL: PSTORE missing from auto.conf"; exit 1; }
-          echo "== pstore config lines =="
-          grep -n 'PSTORE' .config || true
 
       - name: Build zImage with pstore
         run: |
@@ -230,6 +238,17 @@ jobs:
           else
             echo "no kernel/fork.s produced"
           fi
+
+      - name: Upload kconfig evidence (only on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kconfig-evidence
+          path: |
+            rk3288_linux3.10/config.before
+            rk3288_linux3.10/.config
+            rk3288_linux3.10/include/config/auto.conf
+            rk3288_linux3.10/olddefconfig.log
 
       - name: Upload pstore zImage artifacts
         uses: actions/upload-artifact@v4

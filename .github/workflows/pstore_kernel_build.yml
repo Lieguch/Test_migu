@@ -278,6 +278,39 @@ jobs:
             rk3288_linux3.10/include/config/auto.conf
             rk3288_linux3.10/olddefconfig.log
 
+      - name: Kernel image integrity - decompress piggy and verify the Image
+        run: |
+          set -euo pipefail
+          cd rk3288_linux3.10
+          # 为什么不用 QEMU：本内核只有 CONFIG_SERIAL_ROCKCHIP、没有
+          # CONFIG_SERIAL_AMBA_PL011 ⇒ 在 vexpress 上没有任何 console 驱动，
+          # 输出必然为空 = 假阴性。PROJECT-MEMORY §9.30 已明令禁止把这种
+          # "FAIL" 当证据。改用对【本二进制】有效的完整性/健全性检验。
+          test -f arch/arm/boot/compressed/piggy.lzo
+          ls -l arch/arm/boot/compressed/piggy.lzo
+          lzop -d -c arch/arm/boot/compressed/piggy.lzo > /tmp/Image
+          echo "解出的 Image 大小: $(stat -c%s /tmp/Image) B"
+          # ① ARM Linux Image 在 0x24 处有魔数 0x016f2818
+          m=$(od -An -tx4 -j36 -N4 /tmp/Image | tr -d ' \n')
+          echo "Image magic @0x24 = 0x$m"
+          test "0$m" = "0x016f2818" || { echo "FATAL: 解出的不是 ARM Image"; exit 1; }
+          # ② 解出的 Image 必须含【本内核】的版本横幅
+          ver=$(strings /tmp/Image | grep -m1 'Linux version' || true)
+          echo "Image 内内核版本串: ${ver:-<none>}"
+          test -n "$ver" || { echo "FATAL: 解出的 Image 不含内核版本串"; exit 1; }
+          # ③ zImage 必须逐字节携带该 piggy
+          python3 -c 'import sys; z=open("arch/arm/boot/zImage","rb").read(); p=open("arch/arm/boot/compressed/piggy.lzo","rb").read(); i=z.find(p); print("piggy 在 zImage 中的偏移:", i, "长度:", len(p)); sys.exit(0 if i >= 0 and z[i:i+len(p)] == p else 1)'
+          echo "GATE PASS: piggy 可解压、是 ARM Image、是本内核、且被 zImage 完整携带"
+          echo "NOTE: 本项证明镜像完整性与载荷正确性，不声称它能在板子上启动。"
+
+      - name: Upload kernel integrity evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-integrity
+          path: |
+            rk3288_linux3.10/arch/arm/boot/compressed/piggy.lzo
+
       - name: Upload pstore zImage artifacts
         uses: actions/upload-artifact@v4
         with:

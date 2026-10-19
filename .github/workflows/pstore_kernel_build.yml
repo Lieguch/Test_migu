@@ -97,7 +97,7 @@ jobs:
           # Resolve any missing symbols without dropping the explicitly added pstore options.
           # olddefconfig may re-resolve dependencies, but zImage build only requires a
           # consistent .config; we intentionally avoid `make olddefconfig` removing items.
-          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- HOST_EXTRACFLAGS="-fcommon" olddefconfig 2>&1 | tee olddefconfig.log || true
+          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- HOSTCC="gcc -fcommon" olddefconfig 2>&1 | tee olddefconfig.log || true
           # Re-assert pstore flags after kconfig resolution.
           cat >> .config <<'EOF'
           CONFIG_PSTORE=y
@@ -113,9 +113,10 @@ jobs:
           cd rk3288_linux3.10
           # GCC >=10 defaults to -fno-common, which breaks Linux 3.10 host tools:
           #   ld: scripts/dtc/dtc-parser.tab.o: multiple definition of `yylloc'
-          # HOST_EXTRACFLAGS is appended to _hostc_flags in scripts/Makefile.host and
-          # is empty by default, so setting it cannot clobber -Wall/-O2 or -I paths.
-          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- HOST_EXTRACFLAGS="-fcommon" zImage -j"$(nproc)" 2>&1 | tee zImage_build.log
+          # Inject via HOSTCC, NOT via HOST_EXTRACFLAGS: scripts/selinux/Makefile sets
+          # HOST_EXTRACFLAGS := -I security/selinux/include, and a command-line override
+          # clobbers it (run#4 evidence: fatal error: classmap.h: No such file).
+          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- HOSTCC="gcc -fcommon" zImage -j"$(nproc)" 2>&1 | tee zImage_build.log
           test -f arch/arm/boot/zImage
           echo "== zImage info =="
           ls -lh arch/arm/boot/zImage

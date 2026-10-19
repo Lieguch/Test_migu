@@ -204,9 +204,13 @@ jobs:
           echo "== auto.conf: what kbuild actually consumed =="
           grep -E '^(CONFIG_MISC_FILESYSTEMS|CONFIG_PSTORE|CONFIG_PSTORE_CONSOLE|CONFIG_PSTORE_RAM)=' include/config/auto.conf || echo "WARN: absent from auto.conf"
           echo
-          # zImage is compressed (piggy.lzo + head) - `strings zImage` can
-          # never see kernel-internal strings. Verify the uncompressed
-          # vmlinux ELF and System.map instead.
+          # CORRECTION (was wrong): `strings zImage` is NOT always empty.
+          # LZO stores incompressible runs as verbatim literals, so kernel
+          # strings DO leak into piggy.lzo (run#13: 'pstore' @4352184,
+          # 'ramoops' @4352206). But a string can also be swallowed by a
+          # match, so the signal is ONE-WAY: a hit is weak evidence, a miss
+          # proves nothing -> it cannot be a fail-closed gate.
+          # `nm vmlinux` (+ System.map) is the authority.
           echo "== pstore symbols in vmlinux (uncompressed ELF) =="
           syms=$("$LINARO"nm vmlinux 2>/dev/null | grep -iE 'pstore|ramoops|ram_core|last_log|last_kmsg' | sort -u || true)
           echo "${syms:-<none>}"

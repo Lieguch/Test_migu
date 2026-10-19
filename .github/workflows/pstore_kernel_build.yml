@@ -97,7 +97,7 @@ jobs:
           # Resolve any missing symbols without dropping the explicitly added pstore options.
           # olddefconfig may re-resolve dependencies, but zImage build only requires a
           # consistent .config; we intentionally avoid `make olddefconfig` removing items.
-          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- HOSTCC="gcc -fcommon" olddefconfig 2>&1 | tee olddefconfig.log || true
+          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- HOSTCC="gcc -fcommon" KCFLAGS="-std=gnu89" olddefconfig 2>&1 | tee olddefconfig.log || true
           # Re-assert pstore flags after kconfig resolution.
           cat >> .config <<'EOF'
           CONFIG_PSTORE=y
@@ -116,7 +116,11 @@ jobs:
           # Inject via HOSTCC, NOT via HOST_EXTRACFLAGS: scripts/selinux/Makefile sets
           # HOST_EXTRACFLAGS := -I security/selinux/include, and a command-line override
           # clobbers it (run#4 evidence: fatal error: classmap.h: No such file).
-          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- HOSTCC="gcc -fcommon" zImage -j"$(nproc)" 2>&1 | tee zImage_build.log
+          # GCC >=5 defaults to -std=gnu11, where `extern inline` emits an out-of-line copy
+          # in every TU (C99 semantics), so 3.10 headers collide with the real definition:
+          #   error: redefinition of 'return_address' (asm/ftrace.h:48 vs return_address.c:66)
+          # KCFLAGS is appended last (KBUILD_CFLAGS += $(KCFLAGS)), so it clobbers nothing.
+          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- HOSTCC="gcc -fcommon" KCFLAGS="-std=gnu89" zImage -j"$(nproc)" 2>&1 | tee zImage_build.log
           test -f arch/arm/boot/zImage
           echo "== zImage info =="
           ls -lh arch/arm/boot/zImage

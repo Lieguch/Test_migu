@@ -17,6 +17,10 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 180
 
+    env:
+      # era-appropriate cross compiler for Linux 3.10 (see toolchain step)
+      LINARO: /home/runner/toolchain/gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabi/bin/arm-linux-gnueabi-
+
     steps:
       - name: Check Out
         uses: actions/checkout@v4
@@ -37,11 +41,26 @@ jobs:
           DEBIAN_FRONTEND=noninteractive sudo apt-get install -y -qq --no-install-recommends \
             git make gcc-arm-linux-gnueabi g++-arm-linux-gnueabi \
             binutils-arm-linux-gnueabi flex bison libelf-dev \
-            libssl-dev libncurses5-dev xxd curl ca-certificates
+            libssl-dev libncurses5-dev xxd curl ca-certificates xz-utils
           echo "== versions =="
           arm-linux-gnueabi-gcc --version | head -1
           arm-linux-gnueabi-ld --version | head -1
           arm-linux-gnueabi-ar --version | head -1
+
+      - name: Install period-correct ARM cross toolchain (Linaro GCC 4.9.4)
+        run: |
+          set -euo pipefail
+          # See commit message: gcc-11 breaks 3.10 in >=3 independent ways. Use the
+          # era-appropriate toolchain instead of stacking per-symptom workarounds.
+          cd "$HOME"
+          mkdir -p toolchain
+          URL=https://releases.linaro.org/components/toolchain/binaries/4.9-2017.01/arm-linux-gnueabi/gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabi.tar.xz
+          MIRROR=https://mirrors.tuna.tsinghua.edu.cn/armbian-releases/_toolchain/gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabi.tar.xz
+          curl -fsSL --retry 3 -o linaro49.tar.xz "$URL" \
+            || curl -fsSL --retry 3 -o linaro49.tar.xz "$MIRROR"
+          tar Jxf linaro49.tar.xz -C toolchain
+          ls -d "$HOME/toolchain/gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabi"
+          "$HOME/toolchain/gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabi/bin/arm-linux-gnueabi-gcc" --version | head -1
 
       - name: Clone RK3288 Linux 3.10 source
         run: |
@@ -97,7 +116,7 @@ jobs:
           # Resolve any missing symbols without dropping the explicitly added pstore options.
           # olddefconfig may re-resolve dependencies, but zImage build only requires a
           # consistent .config; we intentionally avoid `make olddefconfig` removing items.
-          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- HOSTCC="gcc -fcommon" KCFLAGS="-std=gnu89" olddefconfig 2>&1 | tee olddefconfig.log || true
+          make ARCH=arm CROSS_COMPILE="$LINARO" HOSTCC="gcc -fcommon" olddefconfig 2>&1 | tee olddefconfig.log || true
           # Re-assert pstore flags after kconfig resolution.
           cat >> .config <<'EOF'
           CONFIG_PSTORE=y
@@ -120,7 +139,7 @@ jobs:
           # in every TU (C99 semantics), so 3.10 headers collide with the real definition:
           #   error: redefinition of 'return_address' (asm/ftrace.h:48 vs return_address.c:66)
           # KCFLAGS is appended last (KBUILD_CFLAGS += $(KCFLAGS)), so it clobbers nothing.
-          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- HOSTCC="gcc -fcommon" KCFLAGS="-std=gnu89" zImage -j"$(nproc)" 2>&1 | tee zImage_build.log
+          make ARCH=arm CROSS_COMPILE="$LINARO" HOSTCC="gcc -fcommon" zImage -j"$(nproc)" 2>&1 | tee zImage_build.log
           test -f arch/arm/boot/zImage
           echo "== zImage info =="
           ls -lh arch/arm/boot/zImage
@@ -173,7 +192,7 @@ jobs:
           cd rk3288_linux3.10
           # -save-temps keeps the generated .s; -fverbose-asm annotates it with the
           # originating C source lines so we can see which construct emits .err.
-          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- HOSTCC="gcc -fcommon" \
+          make ARCH=arm CROSS_COMPILE="$LINARO" HOSTCC="gcc -fcommon" \
                KCFLAGS="-std=gnu89 -save-temps -fverbose-asm" kernel/fork.o 2>&1 | tail -30 || true
           if [ -f kernel/fork.s ]; then
             ln=$(grep -n '\.err' kernel/fork.s | head -1 | cut -d: -f1)

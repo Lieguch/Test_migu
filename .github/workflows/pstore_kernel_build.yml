@@ -131,6 +131,12 @@ jobs:
           #     kconfig does not write INVISIBLE symbols at all - neither "=y"
           #     nor "# CONFIG_X is not set" - and warns nothing. Hence
           #     CONFIG_MISC_FILESYSTEMS=y has to be requested explicitly.
+          # Rockchip's own last log: /proc/last_kmsg (+ symlink /proc/last_log).
+          # last_log.c copies the PREVIOUS boot's printk ring buffer out of freshly
+          # allocated pages - it relies on deterministic early allocation plus DRAM
+          # surviving a warm reboot, so it needs NO reserved memory (unlike ramoops).
+          # RK_LAST_LOG depends on DEBUG_KERNEL && PRINTK (mach-rockchip/Kconfig:27);
+          # DEBUG_KERNEL is in lib/Kconfig.debug, sourced by arch/arm/Kconfig.debug.
           printf '%s\n' \
             CONFIG_MISC_FILESYSTEMS=y \
             CONFIG_PSTORE=y \
@@ -140,6 +146,8 @@ jobs:
             CONFIG_DEVTMPFS_MOUNT=y \
             CONFIG_TMPFS=y \
             CONFIG_PROC_FS=y \
+            CONFIG_DEBUG_KERNEL=y \
+            CONFIG_RK_LAST_LOG=y \
             >> .config
           echo "== appended block, verbatim (od, to expose any leading space) =="
           tail -n 8 .config | od -c | head -24
@@ -159,7 +167,7 @@ jobs:
           # "# CONFIG_X is not set" line). A per-symbol gate that NAMES the
           # offending symbol is the only way to catch that whole class; a single
           # combined grep just says "pstore absent" and tells you nothing.
-          for s in CONFIG_MISC_FILESYSTEMS CONFIG_PSTORE CONFIG_PSTORE_CONSOLE CONFIG_PSTORE_RAM; do
+          for s in CONFIG_MISC_FILESYSTEMS CONFIG_PSTORE CONFIG_PSTORE_CONSOLE CONFIG_PSTORE_RAM CONFIG_DEBUG_KERNEL CONFIG_RK_LAST_LOG; do
             grep -q "^$s=y" .config || { echo "FATAL: $s is not =y in .config"; exit 1; }
           done
           echo "  all requested symbols present in .config"
@@ -200,10 +208,10 @@ jobs:
           # never see kernel-internal strings. Verify the uncompressed
           # vmlinux ELF and System.map instead.
           echo "== pstore symbols in vmlinux (uncompressed ELF) =="
-          syms=$("$LINARO"nm vmlinux 2>/dev/null | grep -iE 'pstore|ramoops|ram_core' | sort -u || true)
+          syms=$("$LINARO"nm vmlinux 2>/dev/null | grep -iE 'pstore|ramoops|ram_core|last_log|last_kmsg' | sort -u || true)
           echo "${syms:-<none>}"
           echo "== pstore entries in System.map =="
-          grep -iE 'pstore|ramoops' System.map | head -20 || true
+          grep -iE 'pstore|ramoops|last_log|last_kmsg' System.map | head -20 || true
           echo
           echo "== pstore .o objects built by kbuild =="
           ls -lh fs/pstore/*.o 2>/dev/null || echo "no fs/pstore/*.o (modular build)"

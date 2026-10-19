@@ -166,6 +166,28 @@ jobs:
           fi
           echo "GATE PASS: pstore symbols present in zImage"
 
+      - name: Diagnose .err source (only on failure)
+        if: failure()
+        run: |
+          set -uo pipefail
+          cd rk3288_linux3.10
+          # -save-temps keeps the generated .s; -fverbose-asm annotates it with the
+          # originating C source lines so we can see which construct emits .err.
+          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- HOSTCC="gcc -fcommon" \
+               KCFLAGS="-std=gnu89 -save-temps -fverbose-asm" kernel/fork.o 2>&1 | tail -30 || true
+          if [ -f kernel/fork.s ]; then
+            ln=$(grep -n '\.err' kernel/fork.s | head -1 | cut -d: -f1)
+            echo "ERR_LINE=$ln"
+            if [ -n "$ln" ]; then
+              s=$((ln-30)); [ "$s" -lt 1 ] && s=1
+              e=$((ln+6))
+              echo "----- fork.s context around .err ----- "
+              sed -n "${s},${e}p" kernel/fork.s
+            fi
+          else
+            echo "no kernel/fork.s produced"
+          fi
+
       - name: Upload pstore zImage artifacts
         uses: actions/upload-artifact@v4
         with:

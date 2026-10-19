@@ -288,7 +288,16 @@ jobs:
           # "FAIL" 当证据。改用对【本二进制】有效的完整性/健全性检验。
           test -f arch/arm/boot/compressed/piggy.lzo
           ls -l arch/arm/boot/compressed/piggy.lzo
-          lzop -d -c arch/arm/boot/compressed/piggy.lzo > /tmp/Image
+          # 内核的 lib/decompress_unlzo.c 按 lzop 块结构解析，且原文写着
+          # "don't care about the file name, and skip checksum"；新版 lzop
+          # 对尾字节更严格，会对本内核的 piggy 报 "ignoring trailing garbage"
+          # 并 exit 2。那是工具差异，不是镜像问题 ⇒ 容错退出码，改用产物判据。
+          set +e
+          lzop -d -c arch/arm/boot/compressed/piggy.lzo > /tmp/Image 2>/tmp/lzop.err
+          lzo_rc=$?
+          set -e
+          echo "lzop rc=$lzo_rc"; cat /tmp/lzop.err || true
+          test -s /tmp/Image || { echo "FATAL: lzop 没有产出任何数据"; exit 1; }
           echo "解出的 Image 大小: $(stat -c%s /tmp/Image) B"
           # ① ARM Linux Image 在 0x24 处有魔数 0x016f2818
           m=$(od -An -tx4 -j36 -N4 /tmp/Image | tr -d ' \n')
@@ -300,6 +309,18 @@ jobs:
           test -n "$ver" || { echo "FATAL: 解出的 Image 不含内核版本串"; exit 1; }
           # ③ zImage 必须逐字节携带该 piggy
           python3 -c 'import sys; z=open("arch/arm/boot/zImage","rb").read(); p=open("arch/arm/boot/compressed/piggy.lzo","rb").read(); i=z.find(p); print("piggy 在 zImage 中的偏移:", i, "长度:", len(p)); sys.exit(0 if i >= 0 and z[i:i+len(p)] == p else 1)'
+          # ④ 字节级铁证：解出的 Image 必须与 objcopy 出的 vmlinux 二进制一致
+          "$LINARO"objcopy -O binary -R .note -R .comment -S vmlinux /tmp/vmlinux.bin
+          ls -l /tmp/Image /tmp/vmlinux.bin
+          si=$(stat -c%s /tmp/Image); sv=$(stat -c%s /tmp/vmlinux.bin)
+          echo "Image=$si  vmlinux.bin=$sv"
+          test "$si" = "$sv" || { echo "FATAL: Image 与 vmlinux.bin 大小不一致"; exit 1; }
+          if cmp -s /tmp/Image /tmp/vmlinux.bin; then
+            echo "④ 逐字节相同 OK —— piggy 解出来正是本内核"
+          else
+            echo "FATAL: Image 与 vmlinux.bin 内容不一致"; exit 1
+          fi
+          sha256sum /tmp/Image
           echo "GATE PASS: piggy 可解压、是 ARM Image、是本内核、且被 zImage 完整携带"
           echo "NOTE: 本项证明镜像完整性与载荷正确性，不声称它能在板子上启动。"
 

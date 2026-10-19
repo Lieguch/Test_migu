@@ -317,12 +317,16 @@ jobs:
           else
             echo "FATAL: 解出的 Image 与 arch/arm/boot/Image 不一致"; exit 1
           fi
-          # ② 版本横幅：判据来自 CI clone 日志实测的 Makefile
-          #    （VERSION=3 PATCHLEVEL=10 SUBLEVEL=37 EXTRAVERSION=空）
+          # ② 版本横幅：判据来自 run#17 实测横幅 + 对上游树的 Contents API 实取：
+          #    Makefile:1-4   VERSION=3 PATCHLEVEL=10 SUBLEVEL=37 EXTRAVERSION=空
+          #    Makefile:13    SUBLEVEL = 0   ← 覆盖上面的 37 ⇒ 有效版本 3.10.0
+          #    scripts/setlocalversion:170-172  LOCALVERSION 未设且不在 tag 上
+          #                                    ⇒ 追加 '+'（--depth 1 clone 无 tag）
+          #    run#17 实测横幅：Linux version 3.10.0+ (runner@...) (gcc 4.9.4)
           ver=$(strings /tmp/Image | grep -m1 'Linux version' || true)
           echo "Image 内内核版本串: ${ver:-<none>}"
           test -n "$ver" || { echo "FATAL: 解出的 Image 不含内核版本串"; exit 1; }
-          echo "$ver" | grep -q 'Linux version 3\.10\.37' || { echo "FATAL: 版本串不是本树的 3.10.37"; exit 1; }
+          echo "$ver" | grep -q 'Linux version 3\.10\.0+' || { echo "FATAL: 版本串不是本树的 3.10.0+"; exit 1; }
           # ③ zImage 必须逐字节携带该 piggy
           python3 -c 'import sys; z=open("arch/arm/boot/zImage","rb").read(); p=open("arch/arm/boot/compressed/piggy.lzo","rb").read(); i=z.find(p); print("piggy 在 zImage 中的偏移:", i, "长度:", len(p)); sys.exit(0 if i >= 0 and z[i:i+len(p)] == p else 1)'
           sha256sum /tmp/Image arch/arm/boot/Image

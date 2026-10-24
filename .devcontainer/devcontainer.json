@@ -1,0 +1,27 @@
+{
+  "name": "RK3288 TWRP QEMU Build Environment",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-22.04",
+  "features": {
+    "ghcr.io/devcontainers/features/common:1": {
+      "installZsh": true,
+      "installOhMyZsh": false,
+      "username": "vscode",
+      "userUid": 1000,
+      "userGid": 1000
+    },
+    "ghcr.io/devcontainers/features/git:1": {}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode-remote.remote-ssh"
+      ]
+    }
+  },
+  "postCreateCommand": "bash /workspace/.devcontainer/setup.sh",
+  "remoteUser": "vscode",
+  "hostRequirements": {
+    "memory": "8gb"
+  }
+}

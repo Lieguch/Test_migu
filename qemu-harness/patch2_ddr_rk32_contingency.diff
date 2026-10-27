@@ -1,0 +1,26 @@
+# Patch 2: 内核 ddr_rk32.c ddr_init 容错回退
+# 目标文件：arch/arm/mach-rockchip/ddr_rk32.c
+# 目标函数：ddr_init()
+# 问题：pDDR_REG(ch) 在 QEMU 环境下解析为 0，导致 pDDR_Reg = NULL，读 0+0x8 panic
+# 修复：pDDR_Reg 为 0 时回退到 QEMU DDR model 物理地址 0xff610000
+
+# 位置：ddr_init() 函数内，p_ddr_ch[ch]->pDDR_Reg = pDDR_REG(ch); 之后
+# 大致行号：~第 4345 行（需按实际文件调整）
+
+diff --git a/arch/arm/mach-rockchip/ddr_rk32.c b/arch/arm/mach-rockchip/ddr_rk32.c
+index xxxxxx..yyyyyy 100644
+--- a/arch/arm/mach-rockchip/ddr_rk32.c
++++ b/arch/arm/mach-rockchip/ddr_rk32.c
+@@ -ddr_init,6 +ddr_init,9 @@ int ddr_init(void)
+         p_ddr_ch[ch]->pDDR_Reg = pDDR_REG(ch);
+         p_ddr_ch[ch]->pPHY_Reg = pPHY_REG(ch);
+         p_ddr_ch[ch]->pMSCH_Reg = pMSCH_REG(ch);
++
++        /* QEMU 环境下 RK_DDR_VIRT 可能为 0，回退到 QEMU DDR model 地址 */
++        if (!p_ddr_ch[ch]->pDDR_Reg) {
++            p_ddr_ch[ch]->pDDR_Reg = (pDDR_REG_T)0xff610000ULL;
++            p_ddr_ch[ch]->pPHY_Reg = (pDDRPHY_REG_T)(0xff610000ULL + 0x1000);
++            p_ddr_ch[ch]->pMSCH_Reg = (pMSCH_REG)0xffac0000ULL;
++        }
+     }
+ }

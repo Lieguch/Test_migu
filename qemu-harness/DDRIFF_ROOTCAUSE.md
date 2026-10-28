@@ -471,3 +471,11 @@ input: goodix-ts as /devices/virtual/input/input1
 ① `gtp_i2c_read_dbl_check` 需要连读两次一致，我们只被读 1 次（可能第二次读被判定失败）；
 ② 驱动读的是 `0x8150` 起 `1+8*count` 字节，而我们的 `0x8155 size` 或 count 语义不符；
 ③ 需要在中断后保持 `EXT_PORT` 低电平直到驱动写 `0x814E=0`（我们现在只在 tap 的 150 ms 内保持）。
+
+#### 对照实验（决定性）：中断确实送达
+| 场景 | `0x814E` 读次数 | 说明 |
+|---|---|---|
+| **不注入**（`logs/noinj_err.log`） | **0** | 基线：驱动不会自己读状态 |
+| **注入 `tap 1010 300`**（`logs/g8_err.log`） | **1** | 中断送达 → 驱动读 buffer status ✓ |
+
+⇒ gpio7 EINT → GIC SPI 0x58 的连线**已生效**；剩余问题只在"读到 ready 之后为何不取坐标"。

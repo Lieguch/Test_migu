@@ -479,3 +479,32 @@ input: goodix-ts as /devices/virtual/input/input1
 | **注入 `tap 1010 300`**（`logs/g8_err.log`） | **1** | 中断送达 → 驱动读 buffer status ✓ |
 
 ⇒ gpio7 EINT → GIC SPI 0x58 的连线**已生效**；剩余问题只在"读到 ready 之后为何不取坐标"。
+
+### ★ 触摸建模第四步（同日）：确认驱动读取方式与设备能力
+
+**关键实测（修正了我上一轮的判断）**
+- 驱动不是"读状态再读坐标"，而是**一次读 10 字节**：
+  `[i2c] RX addr=5d n=10 mode=1 mrxraddr=03004e81`（从 `0x814E` 起 10 字节）
+  ⇒ 状态 + 点数据在同一传输里，我们的寄存器布局（0x8150 id / 0x8151-52 x / 0x8153-54 y / 0x8155 size）**是对的**。
+- 之后紧跟 `[i2c] TX addr=5d n=4 b0=ba`（驱动写 `0x814E=0` 清 buffer）⇒ 一轮完整触摸握手走完了。
+
+**设备能力（`/proc/bus/input/devices`，`logs/dev.log`）**
+```
+N: Name="goodix-ts"
+H: Handlers=event1 cpufreq
+B: EV=b            (EV_SYN|EV_KEY|EV_ABS)
+B: ABS=2650000 0
+```
+⇒ 触摸设备已注册为 `event1`，具备 ABS 能力。
+
+**代码改动**
+- tap 不再 150 ms 自动抬起：**保持按下直到驱动写 `0x814E=0`**（2 s 兜底），因为驱动 workqueue 可能晚到；
+- 坐标**锁存**（`gtp_coord_valid`），释放后仍可读，避免驱动取点时已被清空。
+
+**仍未闭环**
+注入 `tap 187 1616`（按 `screen_x=gtp_x*1.6 / screen_y=gtp_y*0.625` 换算，瞄准「保持只读」）后，
+帧缓冲前后仍 `SAME`。下一步要判断"驱动是否真的把事件写进了 event1"：
+- 试过在 ramdisk 里 `timeout 8 cat /dev/input/event1 > /tmp/ev.bin` 再报字节数，
+  但脚本里 `cat` 立即失败（`EV_BYTES=` 为空，20 ms 就返回）⇒ **这是探针工具问题，不能当成"无事件"的证据**。
+- 改进方向：用 `dd if=/dev/input/event1 bs=16 count=N` + 显式 stderr 重定向，先确认 `ls /dev/input/` 可见，
+  再判断事件流；或直接在 TWRP 侧开 `TW_DEBUG_INPUT`（若有）看 minui 是否收到 EV_ABS。

@@ -470,6 +470,7 @@ static uint8_t  gtp_cfg[192];
 #define GTP_IRQ_PIN 6
 
 static int      gtp_touch_active;
+static int      gtp_coord_valid;   /* 坐标锁存：释放后仍可读，供驱动取点 */
 static uint16_t gtp_touch_x, gtp_touch_y;
 static qemu_irq gpio7_irq_line;
 static uint32_t gpio7_int_en, gpio7_int_mask, gpio7_int_status;
@@ -492,6 +493,7 @@ static void gtp_touch_set(int down, uint16_t x, uint16_t y)
     if (down) {
         gtp_touch_x = x;
         gtp_touch_y = y;
+        gtp_coord_valid = 1;
         gpio7_int_status |= (1u << GTP_IRQ_PIN);
     }
     gpio7_update_irq();
@@ -565,8 +567,10 @@ static void gtp_fifo_read(void *opaque)
 
         if (sscanf(line, "tap %u %u", &x, &y) == 2) {
             gtp_touch_set(1, (uint16_t)x, (uint16_t)y);
+            /* ★ 保持按下直到驱动清 buffer（写 0x814E=0），2 s 兜底。
+             * 之前 150 ms 就抬起，驱动 workqueue 晚到时会看到"已无触摸"。 */
             timer_mod(gtp_release_timer,
-                      qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 150);
+                      qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 2000);
         } else if (sscanf(line, "down %u %u", &x, &y) == 2) {
             gtp_touch_set(1, (uint16_t)x, (uint16_t)y);
         } else if (!strncmp(line, "up", 2)) {

@@ -446,6 +446,44 @@ static const hwaddr rk3288_i2c_base[RK3288_I2C_NR] = {
 static const int rk3288_i2c_irq[RK3288_I2C_NR] = { 0x3c, 0x3e, 0x3d, 0x3f, 0x40, 0x41 };
 
 #define ACT8846_ADDR 0x5a
+/* ---- Goodix GTP touch (i2c 0x5d, 16-bit register addressing) ------------
+ * 目的：让 gt9xx 驱动 probe 成功 -> 注册 /dev/input/eventX（触摸屏）。
+ * 设备真实输入只有触摸屏（用户 2026-10-28 明确），所以 harness 必须建模它。
+ * 当前仅实现"静态应答"：product id / config version / 状态寄存器。
+ * 触摸事件注入（需要 gpio7 EINT -> GIC 0x58）为下一步。
+ */
+#define GTP_ADDR 0x5d
+static uint16_t gtp_ptr;
+static uint8_t  gtp_cfg[192];
+
+static void gtp_reset(void)
+{
+    memset(gtp_cfg, 0, sizeof(gtp_cfg));
+    gtp_cfg[0] = 0x43;          /* 0x8047: config version */
+    gtp_ptr = 0;
+}
+
+static uint8_t gtp_read_reg(uint16_t reg)
+{
+    if (reg >= 0x8047 && reg < 0x8047 + sizeof(gtp_cfg)) {
+        return gtp_cfg[reg - 0x8047];
+    }
+    switch (reg) {
+    case 0x8140: return '9';    /* product id "911" */
+    case 0x8141: return '1';
+    case 0x8142: return '1';
+    case 0x8143: return 0;
+    case 0x8144: return 0x02;   /* firmware version */
+    case 0x8145: return 0x04;
+    case 0x8146: return 0x00;   /* x协调 resolution 低字节 */
+    case 0x8147: return 0x08;
+    case 0x8148: return 0xB0;   /* y resolution 0x04B0 = 1200 */
+    case 0x8149: return 0x04;
+    case 0x814A: return 0x35;   /* driver 相关 */
+    case 0x814E: return 0x00;   /* buffer status: 无触摸数据 */
+    default:     return 0;
+    }
+}
 
 #define I2C_IPD_NAKRCV (1u << 6)
 #define I2C_IPD_STOP   (1u << 5)
@@ -501,6 +539,21 @@ static void rk3288_i2c_do_tx(RK3288I2C *s)
         return;
     }
     addr = (i2c_tx_byte(s, 0) >> 1) & 0x7f;
+    if (addr == GTP_ADDR) {
+        /* GTP：tx[1..2] = 16 位寄存器号，tx[3..] = 数据 */
+        if (n >= 3) {
+            gtp_ptr = ((uint16_t)i2c_tx_byte(s, 1) << 8) | i2c_tx_byte(s, 2);
+        }
+        for (i = 3; i < n; i++) {
+            uint16_t r = gtp_ptr + (uint16_t)(i - 3);
+            if (r >= 0x8047 && r < 0x8047 + sizeof(gtp_cfg)) {
+                gtp_cfg[r - 0x8047] = i2c_tx_byte(s, i);
+            }
+        }
+        gtp_ptr = (uint16_t)(gtp_ptr + (n > 3 ? n - 3 : 0));
+        s->ipd |= I2C_IPD_MBTF;
+        return;
+    }
     if (addr != ACT8846_ADDR) {
         s->ipd |= I2C_IPD_NAKRCV;
         return;
@@ -523,6 +576,15 @@ static void rk3288_i2c_do_rx(RK3288I2C *s)
         return;
     }
     addr = (s->mrxaddr >> 1) & 0x7f;
+    if (addr == GTP_ADDR) {
+        uint16_t base16 = gtp_ptr;
+        for (i = 0; i < n; i++) {
+            i2c_set_rx_byte(s, i, gtp_read_reg((uint16_t)(base16 + i)));
+        }
+        gtp_ptr = (uint16_t)(base16 + n);
+        s->ipd |= I2C_IPD_MBRF;
+        return;
+    }
     if (addr != ACT8846_ADDR) {
         s->ipd |= I2C_IPD_NAKRCV;
         return;
@@ -1141,6 +1203,7 @@ static void rk3288_init(MachineState *machine)
     /* 6x RK I2C + ACT8846（i2c-0 @0x5a）。IRQ 必须真接上：
      * 驱动是 wait_event_timeout(is_busy==0)，不拉中断就只会超时 -110。 */
     act8846_reset();
+    gtp_reset();
     for (n = 0; n < RK3288_I2C_NR; n++) {
         MemoryRegion *r = g_new(MemoryRegion, 1);
 

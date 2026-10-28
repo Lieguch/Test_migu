@@ -378,3 +378,43 @@ pmemsave 0x40000000 0x008CA000 "/data/workspace/fb.raw"
 ```
 > ION CMA 基址来自内核日志：`ion heap(cma): base(40000000) size(28000000)`；
 > 分辨率来自 TWRP 日志：`framebuffer: 3 (1920 x 1200)`、`vi.bits_per_pixel = 16`。
+
+---
+
+## 2026-10-28 六次实测：触摸屏建模（Goodix GTP）—— 设备已注册，事件注入待做
+
+### 前提（用户明确）
+**设备没有任何输入设备，只有触摸屏**。所以 harness 必须建模触摸 IC，否则 TWRP UI 无法被驱动。
+
+### 硬件事实（DTB 实测）
+```
+goodix_ts@5d { compatible = "goodix,gt9xx"; reg = <0x5d>;
+               goodix,rst-gpio  = <&gpio7 5 GPIO_ACTIVE_LOW>;
+               goodix,irq-gpio  = <&gpio7 6 IRQ_TYPE_LEVEL_LOW>;
+               goodix,cfg-group0 = [43 b0 04 ... b3 01];   /* 186 字节 */ };
+```
+
+### 已做：QEMU 侧新增 GTP I2C 从设备（16 位寄存器寻址）
+- `rk3288.c`：新增 `GTP_ADDR 0x5d` + `gtp_cfg[192]` 寄存器文件 + `gtp_read_reg()`；
+  `rk3288_i2c_do_tx/do_rx` 增加 GTP 分支（tx[1..2]=16 位寄存器号，数据写入 0x8047 起的配置区）；
+  提供 product id `911`、firmware、分辨率 0x04B0=1200、`0x814E` 状态=0。
+- **效果**（`logs/gtp.log`）：
+```
+<<-GTP-INFO->> IC Version:    _0000
+<<-GTP-ERROR->> Firmware error, no config sent!
+<<-GTP-ERROR->> GTP init panel failed.
+input: goodix-ts as /devices/virtual/input/input1      ← ★ 触摸 input 设备已注册
+<<-GTP-INFO->> GTP works in interrupt mode.
+```
+（对比：加模型前是 `I2C Read: 0x8047 failed errcode -11` ×3 然后放弃，根本没有 input 设备。）
+
+### 仍未完成（按依赖顺序）
+1. **配置交换**：驱动报 `Firmware error, no config sent!` ⇒ 需要正确响应 0x8047 配置区的
+   "版本 + 长度" 语义（或让驱动把 DT 的 186 字节 cfg 写下来后回读一致）。
+2. **gpio7 EINT**：`goodix,irq-gpio = <&gpio7 6 LEVEL_LOW>`；DT `gpio7 interrupts = <0 0x58 4>`
+   ⇒ 需要在 QEMU 里实现 gpio7 bank 的 INT_STATUS/INT_EN 寄存器并连到 GIC SPI 0x58，
+   触摸时拉低该脚。当前 pinctrl 只读 catch-all（全 0），无法产生中断。
+3. **事件注入**：IRQ 打通后，在 0x814E 置 buffer-ready 并在 0x8150.. 填坐标，
+   由驱动上报 `input1` 的 `ABS_MT_POSITION_X/Y`，即可在 QEMU 里"点"TWRP。
+4. TWRP 侧确认：当前 `/tmp/recovery.log` 未见触摸设备相关行（minui 不打印），
+   需在第 3 步后用 `input1` 事件验证 UI 是否响应。

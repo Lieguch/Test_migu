@@ -479,7 +479,10 @@ static uint8_t gtp_read_reg(uint16_t reg)
     case 0x8147: return 0x08;
     case 0x8148: return 0xB0;   /* y resolution 0x04B0 = 1200 */
     case 0x8149: return 0x04;
-    case 0x814A: return 0x35;   /* driver 相关 */
+    case 0x41E4: return 0xBE;   /* ★ 固件校验：驱动要求 ==0xBE，否则
+                                 * "Firmware error, no config sent!" 直接返回 -1 */
+    case 0x814A: return 0x00;   /* ★ sensor_id：驱动要求 < 6，否则
+                                 * "Invalid sensor_id, No Config Sent!" */
     case 0x814E: return 0x00;   /* buffer status: 无触摸数据 */
     default:     return 0;
     }
@@ -493,7 +496,8 @@ static uint8_t gtp_read_reg(uint16_t reg)
 
 typedef struct RK3288I2C {
     uint32_t con, clkdiv, mrxaddr, mrxraddr, mtxcnt, mrxcnt, ien, ipd, fcnt;
-    uint32_t txw[8], rxw[8];        /* 4 字节打包成一个 32 位字（驱动如此） */
+    uint32_t txw[64], rxw[64];      /* 4 字节打包成一个 32 位字；GTP 配置写 186+ 字节 */
+    uint8_t  cur_addr;              /* 当前从机地址（分块续传时后续块不带地址） */
     qemu_irq irq;
 } RK3288I2C;
 
@@ -535,22 +539,37 @@ static void rk3288_i2c_do_tx(RK3288I2C *s)
 {
     unsigned n = s->mtxcnt, i, addr;
 
-    if (n == 0 || n > 32) {
+    if (n == 0 || n > 256) {
         return;
     }
-    addr = (i2c_tx_byte(s, 0) >> 1) & 0x7f;
-    if (addr == GTP_ADDR) {
-        /* GTP：tx[1..2] = 16 位寄存器号，tx[3..] = 数据 */
-        if (n >= 3) {
-            gtp_ptr = ((uint16_t)i2c_tx_byte(s, 1) << 8) | i2c_tx_byte(s, 2);
+    {
+        uint8_t b0 = i2c_tx_byte(s, 0);
+
+        if (b0 == (ACT8846_ADDR << 1) || b0 == (GTP_ADDR << 1)) {
+            addr = (b0 >> 1) & 0x7f;
+            s->cur_addr = (uint8_t)addr;
+        } else {
+            /* ★ 长写会被控制器分块，后续块只有数据、没有地址字节 */
+            addr = s->cur_addr;
         }
-        for (i = 3; i < n; i++) {
+    }
+    fprintf(stderr, "[i2c] TX addr=%02x n=%u b0=%02x\n", addr, n, i2c_tx_byte(s, 0));
+    if (addr == GTP_ADDR) {
+        fprintf(stderr, "[gtp] W n=%u b1=%02x b2=%02x\n", n,
+                n > 1 ? i2c_tx_byte(s, 1) : 0, n > 2 ? i2c_tx_byte(s, 2) : 0);
+        /* GTP：tx[1..2] = 16 位寄存器号，tx[3..] = 数据 */
+        unsigned off = (i2c_tx_byte(s, 0) == (GTP_ADDR << 1)) ? 1 : 0;
+        if (n >= off + 2) {
+            gtp_ptr = ((uint16_t)i2c_tx_byte(s, off) << 8) |
+                      i2c_tx_byte(s, off + 1);
+        }
+        for (i = off + 2; i < n; i++) {
             uint16_t r = gtp_ptr + (uint16_t)(i - 3);
             if (r >= 0x8047 && r < 0x8047 + sizeof(gtp_cfg)) {
                 gtp_cfg[r - 0x8047] = i2c_tx_byte(s, i);
             }
         }
-        gtp_ptr = (uint16_t)(gtp_ptr + (n > 3 ? n - 3 : 0));
+        gtp_ptr = (uint16_t)(gtp_ptr + (n > off + 2 ? n - off - 2 : 0));
         s->ipd |= I2C_IPD_MBTF;
         return;
     }
@@ -558,8 +577,17 @@ static void rk3288_i2c_do_tx(RK3288I2C *s)
         s->ipd |= I2C_IPD_NAKRCV;
         return;
     }
-    if (n > 1) {
-        act8846_ptr = i2c_tx_byte(s, 1);
+    {
+        unsigned off = (i2c_tx_byte(s, 0) == (ACT8846_ADDR << 1)) ? 1 : 0;
+
+        if (n > off) {
+            act8846_ptr = i2c_tx_byte(s, off);
+        }
+        for (i = off + 1; i < n; i++) {
+            act8846_regs[(act8846_ptr + i - off - 1) & 0xff] = i2c_tx_byte(s, i);
+        }
+        s->ipd |= I2C_IPD_MBTF;
+        return;
     }
     for (i = 2; i < n; i++) {
         act8846_regs[(act8846_ptr + i - 2) & 0xff] = i2c_tx_byte(s, i);
@@ -572,12 +600,18 @@ static void rk3288_i2c_do_rx(RK3288I2C *s)
 {
     unsigned n = s->mrxcnt, i, addr, mode, base;
 
-    if (n == 0 || n > 32) {
+    if (n == 0 || n > 256) {
         return;
     }
     addr = (s->mrxaddr >> 1) & 0x7f;
+    fprintf(stderr, "[i2c] RX addr=%02x n=%u mode=%u mrxraddr=%08x con=%08x\n", addr, n, (s->con >> 1) & 3, s->mrxraddr, s->con);
     if (addr == GTP_ADDR) {
-        uint16_t base16 = gtp_ptr;
+        /* ★ 实测：gt9xx 在 rockchip i2c 上走 mode=1，寄存器号放在 MRXRADDR：
+         *   0x0300e441 -> 字节 41 e4 00 03 -> 寄存器 0x41E4（低字节是高位）
+         *   0x03004780 -> 0x8047 ；0x03004081 -> 0x8140
+         * 之前用 gtp_ptr（来自 TX）永远为 0，所以读到 0x0000 -> 固件校验失败。 */
+        uint16_t base16 = (uint16_t)(((s->mrxraddr & 0xff) << 8) |
+                                     ((s->mrxraddr >> 8) & 0xff));
         for (i = 0; i < n; i++) {
             i2c_set_rx_byte(s, i, gtp_read_reg((uint16_t)(base16 + i)));
         }
@@ -602,10 +636,10 @@ static uint64_t rk3288_i2c_read(void *opaque, hwaddr off, unsigned size)
 {
     RK3288I2C *s = opaque;
 
-    if (off >= 0x200 && off < 0x240) {
+    if (off >= 0x200 && off < 0x300) {
         return s->rxw[(off - 0x200) / 4];
     }
-    if (off >= 0x100 && off < 0x140) {
+    if (off >= 0x100 && off < 0x200) {
         return s->txw[(off - 0x100) / 4];
     }
     switch (off) {
@@ -626,7 +660,7 @@ static void rk3288_i2c_write(void *opaque, hwaddr off, uint64_t val, unsigned si
 {
     RK3288I2C *s = opaque;
 
-    if (off >= 0x100 && off < 0x140) {
+    if (off >= 0x100 && off < 0x200) {
         s->txw[(off - 0x100) / 4] = val;
         return;
     }

@@ -418,3 +418,32 @@ input: goodix-ts as /devices/virtual/input/input1      ← ★ 触摸 input 设�
    由驱动上报 `input1` 的 `ABS_MT_POSITION_X/Y`，即可在 QEMU 里"点"TWRP。
 4. TWRP 侧确认：当前 `/tmp/recovery.log` 未见触摸设备相关行（minui 不打印），
    需在第 3 步后用 `input1` 事件验证 UI 是否响应。
+
+### ★ 触摸建模第二步（同日）：GTP 初始化全通 —— 修掉 3 个真实缺陷
+
+| # | 缺陷 | 证据 | 修法 |
+|---|---|---|---|
+| 1 | I2C TX/RX FIFO 窗口只有 `0x100-0x140`（16 字 = 64 B） | 240 B 配置写被截断 | 窗口扩到 `0x100-0x200` / `0x200-0x300`，`txw/rxw[64]`，`n<=256` |
+| 2 | GTP 寄存器号来自 **MRXRADDR**，不是 TX | 打点：`RX addr=5d mode=1 mrxraddr=0300e441`（=0x41E4） | `base16 = ((mrxraddr & 0xff) << 8) \| ((mrxraddr>>8) & 0xff)` |
+| 3 | 长写被控制器**分块**，后续块不含地址字节 | `I2C Write: 0x8047, 240 bytes failed -11` ×5 | 增加 `cur_addr` 状态：首字节等于 `0xb4/0xba` 才当地址，否则视为续传数据 |
+
+另补两个驱动硬性要求的寄存器：
+- `0x41E4` 必须 = `0xBE`（否则 `Firmware error, no config sent!` 直接 return -1）
+- `0x814A` = sensor_id，必须 `< 6`
+
+**结果**（`logs/gtp9.log`）：
+```
+<<-GTP-INFO->> IC Version: 911_0402
+<<-GTP-INFO->> Sensor_ID: 0
+<<-GTP-INFO->> Config group0 used,length: 186
+<<-GTP-INFO->> Driver send config.
+<<-GTP-INFO->> X_MAX: 1200, Y_MAX: 1920, TRIGGER: 0x01
+input: goodix-ts as /devices/virtual/input/input1
+<<-GTP-INFO->> GTP works in interrupt mode.
+```
+注意：`X_MAX=1200 / Y_MAX=1920` 与屏幕 1920x1200 **是转置的**，注入坐标时要交换。
+
+### 还差最后一步：gpio7 EINT
+驱动已进入 interrupt 模式，但 `goodix,irq-gpio = <&gpio7 6 LEVEL_LOW>` 要真实拉低才能触发。
+需要在 QEMU 实现 gpio7 bank（`0xff7e0000`）的 `INT_EN(0x30)/INT_MASK(0x34)/INT_STATUS(0x40)/EXT_PORT(0x50)`
+并连到 GIC SPI `0x58`；随后在 `0x814E` 置 buffer-ready、`0x8150..` 填坐标即可产生真实触摸事件。

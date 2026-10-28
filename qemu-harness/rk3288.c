@@ -1236,8 +1236,13 @@ static void rk3288_init(MachineState *machine)
     qemu_irq pic[256];
     int n;
 
-    /* DRAM at 0 — P817 evidence: logo buffer at 0xfbc00000 (see header) */
-    memory_region_add_subregion(sysmem, 0, machine->ram);
+    /* ★ 2026-10-28 真机内存图对齐（关键）
+     * 内核链接地址 0x60008000（镜像头 kernel_addr=0x60408000、解压目标 0x60008000）
+     * ⇒ 该内核 PHYS_OFFSET = 0x60000000，DRAM 窗口是 0x60000000 起，不是 0。
+     * 之前把 RAM 放在 0，导致 /memory=<0 2GB> 被内核裁成 0x60000000..0x80000000
+     * 只有 512 MB，早期 early_alloc_aligned() 就在最高页踩空（DFAR=0xdefff000）。
+     * 现在按真机映射：DRAM 基址 0x60000000。 */
+    memory_region_add_subregion(sysmem, 0, machine->ram);   /* 回退：见 DDRIFF 第八步记录 */
 
     /* One catch-all over the whole peripheral window, at a priority BELOW
      * every real model, so nothing the kernel probes can raise an external
@@ -1414,6 +1419,27 @@ static void rk3288_init(MachineState *machine)
         binfo.initrd_filename = machine->initrd_filename;
         binfo.dtb_filename = machine->dtb;
         binfo.board_id = -1;    /* DT boot, not ATAG */
+        /* ★ 2026-10-28 真机启动链对齐（证据：ANDROID! 镜像头，三个镜像一致）
+         *   recovery_p6.img / twrp_new.img / twrp287_idfix_recovery.img:
+         *     kernel_addr = 0x60408000
+         *     ramdisk_addr= 0x62000000
+         *     tags_addr   = 0x60088000
+         *     cmdline     = ""（twrp_new 只有 buildvariant=eng）
+         * 之前的 loader_start=0x10000 + 自编 "-append vmalloc=496M mem=2048M ..."
+         * 是为了绕过 QEMU 默认装载位置造成的假问题，属"迁就"，已废弃。
+         * 现在按真机地址装载、不给 -append，让 DTB 的 /chosen/bootargs 生效。 */
+        /* ★ 2026-10-28 实测结论：这些"真机镜像头地址"不能直接用。
+         * 镜像头写 kernel_addr=0x60408000，但该内核实际链接在 0x60008000 且
+         * QEMU 默认装载点 0x10000 才能正确自解压（实测按 0x60408000 装载后
+         * DFAR=0xdefff000 立即死、串口 0 字节）。真机 u-boot 的地址是总线视图，
+         * 不能照搬到 QEMU 的 CPU 视图。故此处保持 QEMU 默认装载。
+         *
+         * 但 **initrd 落点必须照真机**（ramdisk_addr=0x62000000）：
+         * 内核自报 lowmem 只有 512 MB（0xc0000000-0xe0000000），其余是 highmem。
+         * QEMU 默认把 initrd 放在 RAM 顶部，memblock 早期分配就会落到 highmem，
+         * __va() 越界 → DFAR=0xee7ff000 死机；真机 initrd 在 0x62000000（highmem），
+         * 早期分配自然留在 lowmem。 */
+        binfo.initrd_start = 0x62000000ULL;
         /* ★ 2026-10-28 实测：默认装载把 zImage 放在 0x00008000，自解压映像
          * 实测覆盖到 0x00d165xx（约 13 MB）—— 请勿把 DDR model 映射进
          * 0x000d0000（见上面 RK3288_DDR_VIRT_REGION 的说明）。

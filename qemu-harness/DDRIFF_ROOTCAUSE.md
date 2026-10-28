@@ -601,3 +601,56 @@ PID 101 ueventd / 106 healthd / 109 adbd
   bit48/50/53/54/57 = `MT_TOUCH_MAJOR/MT_WIDTH_MAJOR/MT_POSITION_X/MT_POSITION_Y/MT_TRACKING_ID`
   ⇒ **有 POSITION_X/Y 与 TRACKING_ID，没有 MT_SLOT** ⇒ 属 type A 变体。
 - 若 minui 走 type B 分支（要求 SLOT），就会忽略该设备 —— 这与"事件存在但界面不动"一致。
+
+---
+
+## 2026-10-28 第八步 ★ 原则纠正 + 找到"0 字节启动"的总根源
+
+### 用户定的原则（2026-10-28，最高优先级）
+> **目标 = TWRP 在实际设备上正常稳定运行；任何迁就都没有意义。**
+> **在设备模拟启动链中，唯一能修改的只有 TWRP 本身。**
+
+⇒ 含义：
+1. harness 里所有"自编 cmdline / 关 DVFS / 去 sepolicy / 改 TWRP 行为"的**绕过**都不算成果；
+2. harness 只允许做两件事：**忠实建模真机硬件**、**复刻 bootloader 的 fixup 动作**；
+3. 任何"为了让 QEMU 里好看"而改的东西，一律标记为 **HARNESS GAP**，不得计入交付。
+
+### 真机启动链硬事实（ANDROID! 镜像头，三个镜像一致）
+| 字段 | 值 |
+|---|---|
+| kernel_addr | `0x60408000` |
+| ramdisk_addr | `0x62000000` |
+| tags_addr | `0x60088000` |
+| cmdline | **空**（`twrp_new.img` 仅 `buildvariant=eng`） |
+| page_size | 16384 |
+
+### ★ 总根源：initrd 落点，不是内存大小
+内核自报布局（`logs/base.log`）：
+```
+Memory: 2048MB = 2048MB total, 1383872k available, 713280k reserved, 917504K highmem
+lowmem  : 0xc0000000 - 0xe0000000   ( 512 MB)
+vmalloc : 0xe0800000 - 0xff000000   ( 488 MB)
+```
+- 2 GB 内存里 **lowmem 只有 512 MB**，其余是 highmem；`__va()` 一旦指向 highmem 就 fault。
+- QEMU 默认把 initrd 放在 **RAM 顶部**，导致 memblock 的早期分配（`early_alloc_aligned`）
+  落到 highmem → `DFAR=0xee7ff000`（或 0xdefff000）→ 死循环、串口 0 字节。
+- 真机 initrd 在 `0x62000000`（highmem 内），早期分配自然留在 lowmem。
+
+**验证**：只设 `binfo.initrd_start = 0x62000000`、**完全不给 `-append`**、DTB 用真机原始
+`/chosen/bootargs`（`vmalloc=496M`）→ 内核正常启动（`logs/n1.log` 18 767 B，到 `Freeing initrd`）。
+**`vmalloc=496M mem=2048M` 这个人造 cmdline 从此不再需要。**
+
+### 已排除的错解（都是我的假设，已被实测否掉）
+| 假设 | 实测结果 |
+|---|---|
+| 镜像头 `kernel_addr=0x60408000` 可直接当 `loader_start` | 立即 `DFAR=0xdefff000` 死；该内核链接在 `0x60008000`，QEMU 默认装载点才对 |
+| DRAM 窗口在 `0x60000000`（PHYS_OFFSET=0x60000000） | 把 RAM 移到 0x60000000 → 直接挂死；内核自报 lowmem 从 `0xc0000000` 起，说明 PHYS_OFFSET=0 |
+| 原始 DTB `/memory=<0 0>` 是坏的 | 这是 resource DTB，**真机由 u-boot fixup**；补成 `<0 0x80000000>` 是复刻 fixup，正确 |
+
+### 当前状态
+- 真机化配置（无 cmdline + initrd@0x62000000 + 只禁未建模的 VPU/显示/DVFS 节点）
+  能启动到 ~10 s（`logs/n3.log` 53 539 B），但**还没到 `init first stage`**，需继续定位停点。
+- 遗留 **HARNESS GAP**（必须补硬件模型，不许改 TWRP 迁就）：
+  ① 无 PMIC（act8846 的 regulator）→ 只能临时关 `clk_ddr` DVFS；
+  ② 无 VPU/HEVC/IEP/ISP/GPU 模型 → 只能 disable 这些节点；
+  ③ 无 HDMI/MIPI/LVDS/EDP → 同上。

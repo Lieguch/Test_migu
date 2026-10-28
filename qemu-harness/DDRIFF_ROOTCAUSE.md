@@ -447,3 +447,27 @@ input: goodix-ts as /devices/virtual/input/input1
 驱动已进入 interrupt 模式，但 `goodix,irq-gpio = <&gpio7 6 LEVEL_LOW>` 要真实拉低才能触发。
 需要在 QEMU 实现 gpio7 bank（`0xff7e0000`）的 `INT_EN(0x30)/INT_MASK(0x34)/INT_STATUS(0x40)/EXT_PORT(0x50)`
 并连到 GIC SPI `0x58`；随后在 `0x814E` 置 buffer-ready、`0x8150..` 填坐标即可产生真实触摸事件。
+
+### ★ 触摸建模第三步（同日）：gpio7 EINT 打通，中断已能送达驱动
+
+**实现**（`rk3288.c`）：
+- gpio7 bank 模型（`0xff7e0000`，0x100）：`DR 0x00 / DDR 0x08 / INT_EN 0x30 / INT_MASK 0x34 /
+  INT_STATUS 0x40 / EXT_PORT 0x50`，写 1 清中断；`EXT_PORT` 在触摸时把 pin6 拉低（LEVEL_LOW）。
+- 中断线：`gpio7_irq_line = pic[0x58]`（DT `gpio7 interrupts = <0 0x58 4>` → GIC SPI 0x58）。
+- 注入通道：环境变量 `RK3288_TOUCH_FIFO` 指向 FIFO，命令 `tap X Y` / `down X Y` / `up`；
+  tap 150 ms 后自动抬起（QEMUTimer）。
+- GTP 数据：`0x814E` 返回 `0x81`（ready + 1 点）；`0x8150..0x8155` 返回 id/x/y/size；
+  驱动写 `0x814E=0` 时清状态。
+
+**踩到的坑（已修）**：`INT_MASK` 初值我写成 `0xffffffff`（全屏蔽），而驱动只写 `INT_EN`
+不会解 `INT_MASK` ⇒ 中断永远不触发。改为复位全 0（1=masked 语义）。
+
+**实测结果**（`logs/g8_err.log`）：
+- `INT_EN` 被驱动写成 `0x40 / 0x80 / 0xc0`（pin6 使能）✓
+- 注入 `tap 1010 300` 后，出现 **1 次 `0x814E` 读**（`mrxraddr=03004e81`）——此前为 0 次 ✓
+- 但**没有**后续 `0x8150` 坐标读 ⇒ 驱动读完状态位后未取点。
+
+**下一步**：查驱动为何不读 `0x8150`。候选：
+① `gtp_i2c_read_dbl_check` 需要连读两次一致，我们只被读 1 次（可能第二次读被判定失败）；
+② 驱动读的是 `0x8150` 起 `1+8*count` 字节，而我们的 `0x8155 size` 或 count 语义不符；
+③ 需要在中断后保持 `EXT_PORT` 低电平直到驱动写 `0x814E=0`（我们现在只在 tap 的 150 ms 内保持）。

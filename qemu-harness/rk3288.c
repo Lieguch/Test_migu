@@ -38,6 +38,10 @@
 #include "hw/qdev-properties-system.h"
 #include "hw/qdev-properties.h"
 #include "chardev/char-fe.h"
+#include "qemu/timer.h"
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include "hw/misc/unimp.h"
 #include "qemu/error-report.h"
 #include "system/system.h"
@@ -456,6 +460,121 @@ static const int rk3288_i2c_irq[RK3288_I2C_NR] = { 0x3c, 0x3e, 0x3d, 0x3f, 0x40,
 static uint16_t gtp_ptr;
 static uint8_t  gtp_cfg[192];
 
+/* ---- 触摸注入状态 + gpio7 EINT（2026-10-28） ----------------------------
+ * 设备只有触摸屏（用户明确）。gt9xx 走中断模式，IRQ 由 goodix,irq-gpio =
+ * <&gpio7 6 LEVEL_LOW> 提供；DT gpio7 interrupts = <0 0x58 4> -> GIC SPI 0x58。
+ * 注入通道：环境变量 RK3288_TOUCH_FIFO 指向的 FIFO，写入 "tap X Y" / "down X Y" / "up"。
+ */
+#define GPIO7_BASE 0xff7e0000ULL
+#define GPIO7_IRQ_SPI 0x58
+#define GTP_IRQ_PIN 6
+
+static int      gtp_touch_active;
+static uint16_t gtp_touch_x, gtp_touch_y;
+static qemu_irq gpio7_irq_line;
+static uint32_t gpio7_int_en, gpio7_int_mask, gpio7_int_status;
+static uint32_t gpio7_ddr, gpio7_dr;
+static int      gtp_touch_fd = -1;
+static QEMUTimer *gtp_release_timer;
+
+static void gpio7_update_irq(void)
+{
+    if (gpio7_int_status & gpio7_int_en & ~gpio7_int_mask) {
+        qemu_irq_raise(gpio7_irq_line);
+    } else {
+        qemu_irq_lower(gpio7_irq_line);
+    }
+}
+
+static void gtp_touch_set(int down, uint16_t x, uint16_t y)
+{
+    gtp_touch_active = down;
+    if (down) {
+        gtp_touch_x = x;
+        gtp_touch_y = y;
+        gpio7_int_status |= (1u << GTP_IRQ_PIN);
+    }
+    gpio7_update_irq();
+}
+
+static uint64_t rk3288_gpio7_read(void *opaque, hwaddr off, unsigned size)
+{
+    fprintf(stderr, "[gpio7] R %03x\n", (unsigned)off);
+    switch (off) {
+    case 0x00: return gpio7_dr;
+    case 0x04: return 0;
+    case 0x08: return gpio7_ddr;
+    case 0x0c: return 0;
+    case 0x30: return gpio7_int_en;
+    case 0x34: return gpio7_int_mask;
+    case 0x40: return gpio7_int_status;
+    case 0x44: return gpio7_int_status;
+    case 0x50: {                     /* EXT_PORT：触摸时 IRQ 脚为低（LEVEL_LOW） */
+        uint32_t v = 0xffffffffu;
+        if (gtp_touch_active) {
+            v &= ~(1u << GTP_IRQ_PIN);
+        }
+        return v;
+    }
+    default:   return 0;
+    }
+}
+
+static void rk3288_gpio7_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
+{
+    fprintf(stderr, "[gpio7] W %03x = %08x\n", (unsigned)off, (unsigned)val);
+    switch (off) {
+    case 0x00: gpio7_dr = val; break;
+    case 0x04: break;
+    case 0x08: gpio7_ddr = val; break;
+    case 0x0c: break;
+    case 0x30: gpio7_int_en = val; break;
+    case 0x34: gpio7_int_mask = val; break;
+    case 0x38: case 0x3c: case 0x48: case 0x60: break;
+    case 0x40: case 0x44: case 0x4c:            /* 写 1 清中断 */
+        gpio7_int_status &= ~((uint32_t)val);
+        break;
+    default: break;
+    }
+    gpio7_update_irq();
+}
+
+static const MemoryRegionOps rk3288_gpio7_ops = {
+    .read = rk3288_gpio7_read, .write = rk3288_gpio7_write,
+    .valid.min_access_size = 1, .valid.max_access_size = 4,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+static void gtp_release_cb(void *opaque)
+{
+    gtp_touch_set(0, 0, 0);
+}
+
+static void gtp_fifo_read(void *opaque)
+{
+    char buf[512];
+    int n = read(gtp_touch_fd, buf, sizeof(buf) - 1);
+    char *line;
+
+    if (n <= 0) {
+        return;
+    }
+    buf[n] = 0;
+    for (line = strtok(buf, "\n"); line; line = strtok(NULL, "\n")) {
+        unsigned x, y;
+
+        if (sscanf(line, "tap %u %u", &x, &y) == 2) {
+            gtp_touch_set(1, (uint16_t)x, (uint16_t)y);
+            timer_mod(gtp_release_timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 150);
+        } else if (sscanf(line, "down %u %u", &x, &y) == 2) {
+            gtp_touch_set(1, (uint16_t)x, (uint16_t)y);
+        } else if (!strncmp(line, "up", 2)) {
+            gtp_touch_set(0, 0, 0);
+        }
+    }
+}
+
 static void gtp_reset(void)
 {
     memset(gtp_cfg, 0, sizeof(gtp_cfg));
@@ -483,7 +602,14 @@ static uint8_t gtp_read_reg(uint16_t reg)
                                  * "Firmware error, no config sent!" 直接返回 -1 */
     case 0x814A: return 0x00;   /* ★ sensor_id：驱动要求 < 6，否则
                                  * "Invalid sensor_id, No Config Sent!" */
-    case 0x814E: return 0x00;   /* buffer status: 无触摸数据 */
+    case 0x814E:                /* buffer status: bit7=ready, bit3:0=点数 */
+        return gtp_touch_active ? 0x81 : 0x00;
+    case 0x8150: return 0x00;                                   /* track id */
+    case 0x8151: return (uint8_t)(gtp_touch_x & 0xff);           /* x lo */
+    case 0x8152: return (uint8_t)((gtp_touch_x >> 8) & 0xff);    /* x hi */
+    case 0x8153: return (uint8_t)(gtp_touch_y & 0xff);           /* y lo */
+    case 0x8154: return (uint8_t)((gtp_touch_y >> 8) & 0xff);    /* y hi */
+    case 0x8155: return 0x0a;                                   /* size */
     default:     return 0;
     }
 }
@@ -1220,6 +1346,23 @@ static void rk3288_init(MachineState *machine)
         pic[n] = qdev_get_gpio_in(mpcore, n);
     }
     rk3288_saradc_irq = pic[RK3288_SARADC_IRQ];   /* after pic[] is filled */
+
+    /* gpio7 bank：只实现触摸需要的寄存器 + EINT -> GIC SPI 0x58 */
+    rk3288_add_io(sysmem, GPIO7_BASE, 0x100, &rk3288_gpio7_ops, "rk3288-gpio7");
+    gpio7_irq_line = pic[GPIO7_IRQ_SPI];
+    gpio7_int_mask = 0x00000000u;      /* ★ 1=masked；复位应为全 0（不屏蔽），
+                                       *   驱动只写 INT_EN，不会解 INT_MASK */
+    gtp_release_timer = timer_new_ms(QEMU_CLOCK_REALTIME, gtp_release_cb, NULL);
+    {
+        const char *fifo = getenv("RK3288_TOUCH_FIFO");
+
+        if (fifo) {
+            gtp_touch_fd = open(fifo, O_RDONLY | O_NONBLOCK);
+            if (gtp_touch_fd >= 0) {
+                qemu_set_fd_handler(gtp_touch_fd, gtp_fifo_read, NULL, NULL);
+            }
+        }
+    }
 
     /* 5x RK UART at the DTB addresses. serial2 (ff690000) is the device's
      * real console port, so the chardev goes there; the others stay silent. */

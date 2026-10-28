@@ -204,3 +204,67 @@ DTB 的 `/chosen/bootargs` 原本只有 `vmalloc=496M`；QEMU `-append` 会整�
 2. 或让 act8846 完全跳过 gpio（改 `gpios` 为合法 gpio7 两个 pin + 补 `pull/drv` 读回），再验 `vdd_logic` 是否出现。
 3. 内核侧兜底（需源码重建）：`rockchip_cpufreq_reboot_limit_freq()` 里对 `IS_ERR(regulator)` 直接返回。
 ```
+
+---
+
+## 2026-10-28 三次实测：三条根因逐个解除，**stock recovery 已在 QEMU 跑起来**
+
+### ① bootargs 被 `-append` 覆盖（已修，见上节）
+`-append "console=ttyS2,115200 vmalloc=496M mem=2048M clk_ignore_unused cpufreq=disabled loglevel=7"`
+
+### ② DDR 变频导致 `ddrfreqd` oops（已修）
+- 现象：`regulator_get_voltage+0x8` 解引用 `ERR_PTR 0xfffffe2b`，调用链
+  `rockchip_cpufreq_reboot_limit_freq ← ddrfreq_work ← ddrfreq_task`，@5.44–5.49 s。
+- **官方解法**（《Rockchip DDR 开发指南》kernel 3.10 章节）：把 DTS 里最终的
+  `clk_ddr_dvfs_table` 节点置 `status="disabled"`。本 DTB 对应路径：
+  `/dvfs/vd_logic/pd_ddr/clk_ddr`。
+- 实测：`fdtput -t s d5.dtb /dvfs/vd_logic/pd_ddr/clk_ddr status disabled`
+  → `logs/d5.log`：**oops=0、ddrfreqd=0、regfail 10→6**。
+
+### ③ sepolicy v30 > 内核上限 28（已定性：这是**artefact 选错**，不是 harness 问题）
+```
+SELinux:  policydb version 30 does not match my version range 15-28
+selinux:  Could not load policy:  Invalid argument
+init: Failed to load monolithic SELinux policy: Invalid argument
+init: Reboot start, reason: reboot, rebootTarget: bootloader      → System halted
+```
+- `twrp_new.img` 里的 ramdisk 是 **android-9 的 TWRP 3.3.1**（init 打印
+  `init first stage started` / `Skipped setting INIT_AVB_VERSION` 是 8/9 代特征）。
+- 换 stock 的 v26 策略后策略能加载，但继续失败：
+  `Could not set context for /init: Operation not supported on transport endpoint`
+  （rootfs 无 xattr）→ 仍 reboot。
+- 去掉 `/sepolicy` 更糟：`Could not open /sepolicy` → `Unable to load SELinux policy` → reboot。
+- ⇒ **该 ramdisk 与本内核（3.10 / policy ≤28）根本不配套**，与项目 §9.20 的结论一致：
+  应该用 **omni-4.4 / TWRP 2.8.7** 的 ramdisk。
+
+### ④ 里程碑：stock 4.4 内核 + stock ramdisk → recovery 二进制在跑
+`logs/stock_ok.log`（75 554 B / 1 079 行，100 s 不崩）：
+```
+[24.85] init: property 'ro.serialno' doesn't exist ...
+# Starting recovery on Thu Jan  1 00:00:24 1970
+cmdline=console=ttyS2,115200 vmalloc=496M mem=2048M clk_ignore_unused cpufreq=disabled loglevel=7
+bootmode = unknown
+recovery filesystem table
+  0 /mnt/internal_sd vfat /dev/block/rknand_user 0
+  1 /mnt/external_sd vfat /dev/block/mmcblk0p1 0
+  ...
+ 17 /tmp ramdisk ramdisk 0
+I/ bootable/recovery/recovery.cpp:1589 SetSdcardRootPath; InternalSD_ROOT: /mnt/internal_sd
+W/ roots.cpp:149 ensure_path_mounted; failed to mount /dev/block/rknand_cache at /cache
+E:Can't mount /cache/recovery/last_locale
+failed to read font: res=-1
+```
+之后稳定打印 `>>>> pwrsw pin = 0,2`（内核电源键轮询，§9.59-E 已判为内核侧），
+**无 oops / 无 panic / 无 reboot**。
+
+### 结论与下一步
+- harness 已证明可跑到 userspace recovery；剩余阻塞是 **TWRP 2.8.7(omni-4.4) ramdisk 未就位**。
+- 下一步：①取/构建 2.8.7 ramdisk（repo 的 `build_twrp_44.yml` 产物即为此）；
+  ②用同一配方 + `d5.dtb` 跑它；③再做 Route A（显示上电：act8846/gpio0 或固定 vdd_logic）。
+- 复现：
+```bash
+Q=./rk3288/qemu-src/build/qemu-system-arm
+$Q -M rk3288 -smp 1 -m 2048 -kernel t78_stage/stock_zImage -initrd t78_stage/stock_ramdisk.gz \
+  -append "console=ttyS2,115200 vmalloc=496M mem=2048M clk_ignore_unused cpufreq=disabled loglevel=7" \
+  -display none -serial file:logs/stock_ok.log -monitor none -no-reboot -dtb d5.dtb
+```

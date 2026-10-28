@@ -167,3 +167,21 @@
 - `vmlinux-to-elf kimg.bin vmlinux.elf`：从 `pmemsave` dump 恢复 71 336 个符号（已验证可用）
 - `-d int,guest_errors -D logs/int.log`：抓首次异常（DFAR/IFAR）
 - `-d in_asm -D logs/inasm.log`：看最后执行的翻译块
+
+---
+
+## 11. 2026-10-28 三次实测：三条根因全解，stock recovery 已跑起来
+
+| # | 阻塞 | 根因 | 解法（已固化） |
+|---|---|---|---|
+| ① | 串口 0 字节、早期 `DFAR=0xee7ff000` | `-append` 整段替换 DTB `/chosen/bootargs`，丢了 `vmalloc=` | 命令行补 `vmalloc=496M mem=2048M` |
+| ② | 5.44–5.49 s `ddrfreqd` oops（`regulator_get_voltage` 解引用 `ERR_PTR`） | DDR 变频在跑，而 PMIC/regulator 缺失 | **官方文档解法**：`/dvfs/vd_logic/pd_ddr/clk_ddr` 置 `disabled`（= kernel 3.10 的 `clk_ddr_dvfs_table`） |
+| ③ | init 加载 sepolicy 失败 → reboot bootloader | `twrp_new.img` 的 ramdisk 是 **android-9 TWRP 3.3.1**（policy v30），内核只支持 ≤28 | 属 **artefact 选错**：应换 omni-4.4 / TWRP 2.8.7 的 ramdisk |
+
+**里程碑**：`stock 4.4 zImage + stock ramdisk + 上述配方` → `# Starting recovery on ... 1970`，
+recovery 解析 fstab、`SetSdcardRootPath`、报 `/cache` 挂载失败、`failed to read font`；
+之后稳定跑 `>>>> pwrsw pin = 0,2`（内核电源键轮询）**100 s 无 oops / 无 panic / 无 reboot**。
+
+**新增脚本**：`qemu-harness/mk_p817_run_dtb.sh` —— 一键生成 QEMU 用 DTB（含上述关键 dvfs 关闭）。
+
+**下一步**：拿到/构建 TWRP 2.8.7(omni-4.4) ramdisk → 同配方跑；随后 Route A（显示上电）。

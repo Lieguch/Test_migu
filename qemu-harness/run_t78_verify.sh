@@ -1,35 +1,38 @@
 #!/bin/bash
 # =====================================================================
-# 验证 t78 等效组合：run13/zImage + twrp_ramdisk.gz
-# 需在 Codespaces 中先构建 QEMU（build_qemu_codespace.sh），再运行此脚本
+# t78 等效验证（2026-10-28 实测可跑通版）
+# 关键：-append 会整段替换 DTB 的 /chosen/bootargs，必须补回 vmalloc= 与 mem=
+#       否则早期 early_alloc_aligned() 的 __va() 落到未映射线性区 → 串口 0 字节
+# 已验证：串口 90 756 字节，内核跑到 `init: init first stage started!`
+# 当前崩点：5.44–5.49 s ddrfreqd oops（regulator 缺失，见 DDRIFF_ROOTCAUSE.md）
 # =====================================================================
-set -euo pipefail
+set -uo pipefail
 
-cd /workspace
+W=${W:-/data/workspace}
+Q=${Q:-$W/rk3288/qemu-src/build/qemu-system-arm}
+STAGE=${STAGE:-$W/t78_stage}
+LOG=${LOG:-$W/logs/t78_verify.log}
+TMO=${TMO:-120}
 
-QEMU=./qemu-src/build/qemu-system-arm
-ZIMAGE=/workspace/zImage        # 需提前放入工作区：run13/zImage
-RAMDISK=/workspace/twrp_ramdisk.gz  # 需提前放入工作区：twrp_ramdisk.gz
-DTB=/workspace/p817.dtb         # 需提前放入工作区
+APP="console=ttyS2,115200 vmalloc=496M mem=2048M clk_ignore_unused cpufreq=disabled loglevel=7"
 
-echo "=== 验证输入文件 ==="
-ls -la "$ZIMAGE" "$RAMDISK" "$DTB" 2>&1 || {
-    echo "错误：缺少输入文件，请将 zImage、twrp_ramdisk.gz、p817.dtb 放入 /workspace"
-    exit 1
-}
+mkdir -p "$(dirname "$LOG")"
+echo "=== qemu: $Q ==="
+"$Q" -machine help 2>/dev/null | grep -i rk3288 || { echo "FATAL: rk3288 machine missing"; exit 1; }
 
-echo "=== 启动 QEMU（RK3288 机型）==="
-"$QEMU" \
-    -M rk3288 \
-    -m 256M \
-    -kernel "$ZIMAGE" \
-    -ramdisk "$RAMDISK" \
-    -dtb "$DTB" \
-    -append "console=ttyAMA0 androidboot.hardware=rk30board" \
-    -serial stdio \
-    -no-reboot \
-    -d guest_errors \
-    -D /workspace/qemu.log
+echo "=== run (${TMO}s) ==="
+timeout "$TMO" "$Q" -M rk3288 -smp 1 -m 2048 \
+  -kernel "$STAGE/zImage_run13" -initrd "$STAGE/twrp_ramdisk.gz" \
+  -append "$APP" -display none -serial "file:$LOG" -monitor none -no-reboot \
+  -dtb "$W/p817_run.dtb" >/dev/null 2>&1
+rc=$?
 
-echo "=== QEMU 退出，检查日志 ==="
-grep -i "LANG\|ddr_init\|panic\|NULL\|Unable to handle" /workspace/qemu.log || true
+echo "rc=$rc bytes=$(wc -c < "$LOG" 2>/dev/null || echo 0) lines=$(wc -l < "$LOG" 2>/dev/null || echo 0)"
+echo "--- key hits ---"
+for p in "DDR DEBUG: init success" "Freeing initrd" "init first stage started" \
+         "First stage mount skipped" "Run /init" "TWRP" "I: LANG" \
+         "can't get regulator" "Internal error" "Unable to handle" "Kernel panic"; do
+  n=$(grep -ac "$p" "$LOG" 2>/dev/null || true)
+  [ "${n:-0}" -gt 0 ] && echo "  HIT  $p ($n)"
+done
+echo "--- tail 12 ---"; tail -12 "$LOG"

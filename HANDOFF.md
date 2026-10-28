@@ -123,3 +123,47 @@
 2. 改原厂文件前必须先说「改什么 / 怎么改 / 如何回退」。
 3. 构建产物（`.o`）**不入库**；编译够便宜就不要缓存。
 4. 每次代码提交必须附带更新版 HANDOFF.md 并推送 GitHub，完成跨 agent 交接。
+
+---
+
+## 10. 2026-10-28 实测更新（InstaBox 云机）：t78 已能跑到 userspace init
+
+### 可用环境（替代已耗尽的 CNB）
+- InstaBox 机器 `m_agqychrdvyurnyynpkspkaam6q`（4vCPU/8GiB/Debian 13，免密 sudo）
+- 凭据与 helper 见 `~/.workbuddy/user-*/INSTABOX.md` 与 `bin/ibx.sh`
+- 机器上：`/data/workspace/rk3288/qemu-src/build/qemu-system-arm`（QEMU v10.0.1 + rk3288 机器，已构建）
+- 输入：`/data/workspace/t78_stage/{zImage_run13,twrp_ramdisk.gz,stock_*,p817.dtb}`
+
+### ★ 可跑配方（关键，别丢 bootargs）
+```bash
+./rk3288/qemu-src/build/qemu-system-arm -M rk3288 -smp 1 -m 2048 \
+  -kernel t78_stage/zImage_run13 -initrd t78_stage/twrp_ramdisk.gz \
+  -append "console=ttyS2,115200 vmalloc=496M mem=2048M clk_ignore_unused cpufreq=disabled loglevel=7" \
+  -display none -serial file:logs/t78.log -monitor none -no-reboot -dtb p817_run.dtb
+```
+`-append` 会**整段替换** DTB 的 `/chosen/bootargs`（原值 `vmalloc=496M`），漏掉 `vmalloc=`/`mem=` 时
+内核在 `early_alloc_aligned()` 就踩未映射线性区（`DFAR=0xee7ff000`），串口 0 字节。
+
+### 实测结果（logs/t78_ok.log，90 756 B / 1 345 行）
+- ✅ `DDR DEBUG: init success` ×2、`Freeing initrd` ×2 —— **`ddr_init` NULL 解引用不再出现**
+- ✅ `init: init first stage started!` / `First stage mount skipped (recovery mode)` —— TWRP 的 init 已执行
+- ❌ 5.44–5.49 s：`ddrfreqd` oops（`regulator_get_voltage` ← `rockchip_cpufreq_reboot_limit_freq` ← `ddrfreq_work`）
+  根因链：`act8846 gpios` 引用 gpio0（`0xb2`），而 pinctrl 只建了 gpio1..8/15 → probe 失败 →
+  `vdd_logic/vdd_arm/vdd_gpu` 缺失 → `DVFS ERR: can't get regulator` ×10 → ERR_PTR 被当指针解引用。
+
+### 补丁 1 的最终裁定
+- `0x000d0000` 注册 DDR model **不可用**：zImage 装在 `0x00010000`，自解压映像覆盖到 `0x00d165xx`，
+  该地址在映像内，挖 16 KiB 后自解压器死在 `0xd13af8 b .`。
+- 代码里已改为默认关闭（`#ifdef RK3288_DDR_VIRT_REGION`），并在注释中记录实测。
+
+### 下一步
+1. 补 QEMU 的 `gpio0`（bank0 的 `mux/pull/drv` 附加 reg 读回）→ act8846 probe 通过 → regulator 出现。
+2. 或改 DTB `act8846/gpios` 全用已存在的 gpio7 两个 pin，并验证 `vdd_logic` 是否注册。
+3. 兜底：内核源码重建，在 `rockchip_cpufreq_reboot_limit_freq()` 里 `IS_ERR()` 直接返回。
+4. 之后才是 Route A（显示上电）与 servicemanager。
+
+### 复现用仪器（机器上）
+- `qmp_pc.py` / `qmp_mem.py`：QMP 取寄存器/内存
+- `vmlinux-to-elf kimg.bin vmlinux.elf`：从 `pmemsave` dump 恢复 71 336 个符号（已验证可用）
+- `-d int,guest_errors -D logs/int.log`：抓首次异常（DFAR/IFAR）
+- `-d in_asm -D logs/inasm.log`：看最后执行的翻译块

@@ -149,3 +149,58 @@ bash /data/workspace/build_qemu.sh
 # 首次异常（关键仪器）
 ... -serial null -d int,guest_errors -D logs/int.log
 ```
+
+---
+
+## 2026-10-28 二次实测（关键突破）：真因是 bootargs 被 `-append` 覆盖
+
+### 结论 0（最高价值）：加上 `vmalloc=496M mem=2048M` 内核才真正启动
+| 组合 | 串口字节 | 结果 |
+|---|---|---|
+| `console=ttyFIQ0 console=ttyS2,115200 loglevel=7 clk_ignore_unused cpufreq=disabled` | **0** | 早期 data abort（见上节） |
+| `console=ttyS2,115200 vmalloc=496M loglevel=7` | **0** | 同上 |
+| **`console=ttyS2,115200 vmalloc=496M mem=2048M clk_ignore_unused cpufreq=disabled loglevel=7`** | **90 756** | **内核启动到 userspace** |
+
+DTB 的 `/chosen/bootargs` 原本只有 `vmalloc=496M`；QEMU `-append` 会整段替换它 ⇒ 丢掉 `vmalloc=` 后
+早期 `early_alloc_aligned()` 的 `__va(memblock_alloc())` 落到未映射线性区 → `DFAR=0xee7ff000` 死循环。
+（符号由 `vmlinux-to-elf` 从内存 dump 恢复，71 336 个符号；`0xc0a27458 = early_alloc_aligned`。）
+
+### 结论 1：TWRP 的 Android init 已经跑起来了（本次首次达成）
+```
+[5.404] init: init first stage started!
+[5.406] init: First stage mount skipped (recovery mode)
+[5.410] init: Using Android DT directory /proc/device-tree/firmware/android/
+```
+`DDR DEBUG: init success` ×2、`Freeing initrd` ×2 均命中 ⇒ 之前 t78 的 `ddr_init` NULL 解引用**不再出现**。
+
+### 结论 2：新崩点 = PMIC/regulator 缺失 → ddrfreqd oops（5.44–5.49 s）
+```
+[0.585] act8846_i2c_probe,line=898
+[0.587] act8846_parse_dt,line=746
+[0.588] invalid gpio: -2  ×4 ; WARNING at drivers/gpio/gpiolib.c:126 gpio_to_desc
+[0.589] act8846 0-005a: Failed to request gpio -2 with ret:-22
+[4.35 ] DVFS ERR: clk_enable_dvfs: vd(vd_logic) can't get regulator(vdd_logic)!   (×10)
+[5.49 ] Unable to handle kernel paging request at virtual address fffffe2b
+        PC is at regulator_get_voltage+0x8/0x34
+        LR is at rockchip_cpufreq_reboot_limit_freq+0x44/0x68
+        ← ddrfreq_work+0x4c/0x368 ← ddrfreq_task+0x40/0x1c8 ← kthread
+```
+- `fffffe2b` = 把 `ERR_PTR` 当指针解引用（`ldr r0,[r0,#0x30]`，`Code: ... (e5900030)`）。
+- act8846 的 `gpios = <0xb3 1 1 0xb2 0xa 0>`：`0xb3`=gpio7@ff7e0000（存在）、`0xb2`=**gpio0@ff750000**
+  （pinctrl 日志只建了 gpio1..gpio8/gpio15，**没有 gpio0**，其 reg 含 `mux_bank0@ff730084` 属 PMU 区）
+  ⇒ `of_get_named_gpio` 对 gpio0 返回 -2 ⇒ probe 失败 ⇒ 无 `vdd_logic/vdd_arm/vdd_gpu`。
+
+### 已试过的 DTB 变体（都仍 oops，但缩小了范围）
+| 变体 | 结果 |
+|---|---|
+| 删 `act8846@5a/gpios` | probe 仍失败（driver 仍读 "gpios"，取到 -2） |
+| `act8846@5a status=disabled` | act8846 行消失，但 oops 仍在 ⇒ 崩溃不依赖该 PMIC 注册成功 |
+| `/dvfs status=disabled` | oops 仍在 ⇒ ddrfreqd 线程不受 /dvfs 状态控制 |
+| `gpios` 两处都改 `0xb3`(gpio7) | `act8846_pmic_hold=0`、`parse_dt` 通过前半，仍 `Failed to request gpio` |
+
+### 下一步（按性价比）
+1. **补 gpio0 模型**（QEMU）：`gpio0@ff750000` 的 bank0 需要 `mux_bank0/pull_bank0/drv_bank0` 三个附加 reg
+   可读；让 pinctrl 建出 gpio0 ⇒ act8846 probe 通过 ⇒ 稳压器注册 ⇒ DVFS/ddrfreq 正常。
+2. 或让 act8846 完全跳过 gpio（改 `gpios` 为合法 gpio7 两个 pin + 补 `pull/drv` 读回），再验 `vdd_logic` 是否出现。
+3. 内核侧兜底（需源码重建）：`rockchip_cpufreq_reboot_limit_freq()` 里对 `IS_ERR(regulator)` 直接返回。
+```

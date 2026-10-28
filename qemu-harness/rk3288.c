@@ -1039,7 +1039,16 @@ static void rk3288_init(MachineState *machine)
     rk3288_add_io(sysmem, RK3288_SGRF_ALT,  0x1000, &rk3288_sgrf_ops, "rk3288-sgrf-alt");
     rk3288_add_io(sysmem, RK3288_MSCH_BASE, 0x1000, &rk3288_msch_ops, "rk3288-msch");
     rk3288_add_io(sysmem, RK3288_DDR_BASE,  RK3288_DDR_SIZE, &rk3288_ddr_ops, "rk3288-ddr");
-    rk3288_add_io(sysmem, RK3288_DDR_VIRT_BASE, RK3288_DDR_SIZE, &rk3288_ddr_ops, "rk3288-ddr-virt");
+    /* ★ 补丁 1 的区域默认关闭（2026-10-28 实测证据）：
+     * 该内核用默认 loader_start 装到 0x00008000，自解压后映像约 13 MB
+     * （字符串区实测在 0x00d165xx），正好覆盖 0x000d0000。若在此注册
+     * DDR model，会把自解压器自己的代码/数据挖掉 16 KiB ⇒ 死在
+     * 0xd13af8 `b .`，串口 0 字节。要用本方案，必须同时把内核装到
+     * 0x000d4000 以上且避开其 TEXTADDR；否则应走内核侧补丁 2。 */
+#ifdef RK3288_DDR_VIRT_REGION
+    rk3288_add_io(sysmem, RK3288_DDR_VIRT_BASE, RK3288_DDR_SIZE,
+                  &rk3288_ddr_ops, "rk3288-ddr-virt");
+#endif
 
     /* TSADC: a constant 0 degC reading keeps dvfs_temp_limit_work_func()
      * inside its debounce (delta_temp <= 1) so it never calls into the
@@ -1154,6 +1163,12 @@ static void rk3288_init(MachineState *machine)
         binfo.initrd_filename = machine->initrd_filename;
         binfo.dtb_filename = machine->dtb;
         binfo.board_id = -1;    /* DT boot, not ATAG */
+        /* ★ 2026-10-28 实测：默认装载把 zImage 放在 0x00008000，自解压映像
+         * 实测覆盖到 0x00d165xx（约 13 MB）—— 请勿把 DDR model 映射进
+         * 0x000d0000（见上面 RK3288_DDR_VIRT_REGION 的说明）。
+         * 另测：改 loader_start 到 0x02080000 会因 zImage 内置 TEXTADDR
+         * 不匹配而死在 0xffff000c（prefetch abort 自循环）；
+         * 改到 0x00100000 仍未产出任何串口输出。故保持默认装载地址。 */
         arm_load_kernel(ARM_CPU(qemu_get_cpu(0)), machine, &binfo);
     }
 }

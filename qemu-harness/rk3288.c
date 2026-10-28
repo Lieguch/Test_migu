@@ -470,7 +470,7 @@ static uint8_t  gtp_cfg[192];
 #define GTP_IRQ_PIN 6
 
 static int      gtp_touch_active;
-static int      gtp_coord_valid;   /* 坐标锁存：释放后仍可读，供驱动取点 */
+static int      gtp_coord_valid;
 static uint16_t gtp_touch_x, gtp_touch_y;
 static qemu_irq gpio7_irq_line;
 static uint32_t gpio7_int_en, gpio7_int_mask, gpio7_int_status;
@@ -549,7 +549,11 @@ static const MemoryRegionOps rk3288_gpio7_ops = {
 
 static void gtp_release_cb(void *opaque)
 {
+    /* 释放：清按下 + 再拉一次中断，让驱动读到 status=0 并上报"抬起"。
+     * 必须延迟（100 ms）执行：立刻拉会打断驱动处理刚取到的点数据（实测 events=0）。 */
     gtp_touch_set(0, 0, 0);
+    gpio7_int_status |= (1u << GTP_IRQ_PIN);
+    gpio7_update_irq();
 }
 
 static void gtp_fifo_read(void *opaque)
@@ -608,12 +612,14 @@ static uint8_t gtp_read_reg(uint16_t reg)
                                  * "Invalid sensor_id, No Config Sent!" */
     case 0x814E:                /* buffer status: bit7=ready, bit3:0=点数 */
         return gtp_touch_active ? 0x81 : 0x00;
-    case 0x8150: return 0x00;                                   /* track id */
-    case 0x8151: return (uint8_t)(gtp_touch_x & 0xff);           /* x lo */
-    case 0x8152: return (uint8_t)((gtp_touch_x >> 8) & 0xff);    /* x hi */
-    case 0x8153: return (uint8_t)(gtp_touch_y & 0xff);           /* y lo */
-    case 0x8154: return (uint8_t)((gtp_touch_y >> 8) & 0xff);    /* y hi */
-    case 0x8155: return 0x0a;                                   /* size */
+    /* ★ GT911 点数据从 0x814F 开始（track id 在 0x814F，不是 0x8150）。
+     * 之前整体错位 1 字节，驱动算出的 y 是垃圾值 ⇒ 事件被丢弃（event1 0 字节）。 */
+    case 0x814F: return 0x00;                                   /* track id */
+    case 0x8150: return (uint8_t)(gtp_touch_x & 0xff);           /* x lo */
+    case 0x8151: return (uint8_t)((gtp_touch_x >> 8) & 0xff);    /* x hi */
+    case 0x8152: return (uint8_t)(gtp_touch_y & 0xff);           /* y lo */
+    case 0x8153: return (uint8_t)((gtp_touch_y >> 8) & 0xff);    /* y hi */
+    case 0x8154: return 0x0a;                                   /* size */
     default:     return 0;
     }
 }
@@ -694,7 +700,8 @@ static void rk3288_i2c_do_tx(RK3288I2C *s)
                       i2c_tx_byte(s, off + 1);
         }
         for (i = off + 2; i < n; i++) {
-            uint16_t r = gtp_ptr + (uint16_t)(i - 3);
+            uint16_t r = gtp_ptr + (uint16_t)(i - off - 2);
+
             if (r >= 0x8047 && r < 0x8047 + sizeof(gtp_cfg)) {
                 gtp_cfg[r - 0x8047] = i2c_tx_byte(s, i);
             }

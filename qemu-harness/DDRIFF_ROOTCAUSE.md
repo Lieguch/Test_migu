@@ -356,3 +356,25 @@ TWRP 的 stdout **不接控制台**，它只写 `/tmp/recovery.log`。
 - 显示验证：QEMU 加 `-display vnc=:0` 或 `-device VGA` 截屏，确认 splash/主菜单实际画面。
 - 交互验证：给 QEMU 接 evdev/鼠标，验证触摸映射（真实目的是绕开坏电源键）。
 - 收尾：把本配方回灌 `HANDOFF.md` 与 build 流程，作为「TWRP 可跑」的验收基线。
+
+### ★ 画面验证（同日）：帧缓冲 dump 出真实 TWRP 界面
+`fb0.bmp` / `evidence/twrp_ui_2026-10-28.png`（1920x1200，RGB565→24bpp）内容：
+- 顶部状态栏：左 `3.1.1-0`，中 `7:00 PM`
+- 标题：**未修改的 System 分区**（TWRP logo）
+- 正文：**是否保持系统分区为只读？** + 中文说明段
+- 复选框：**下次启动时不再显示此界面**
+- 按钮：**保持只读** / **选择语言**
+- 底部滑块：**滑动按钮允许修改**
+- 底部：Android 三键导航（返回/主页/最近）
+
+**取证方法**（QEMU 无显示设备时唯一可行路径）：
+```bash
+# 1) 后台跑 TWRP，开 QMP
+$Q ... -display none -qmp unix:/data/workspace/mon.sock,server,nowait &
+sleep 45
+# 2) 帧缓冲在 ION CMA 起始处：base=0x40000000，双缓冲 2×1920×1200×2 = 0x8CA000
+pmemsave 0x40000000 0x008CA000 "/data/workspace/fb.raw"
+# 3) RGB565 → BMP/PNG（脚本 /data/workspace/fbdump.py，仓库同源）
+```
+> ION CMA 基址来自内核日志：`ion heap(cma): base(40000000) size(28000000)`；
+> 分辨率来自 TWRP 日志：`framebuffer: 3 (1920 x 1200)`、`vi.bits_per_pixel = 16`。

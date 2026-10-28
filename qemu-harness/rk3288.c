@@ -457,6 +457,15 @@ static const int rk3288_i2c_irq[RK3288_I2C_NR] = { 0x3c, 0x3e, 0x3d, 0x3f, 0x40,
  * 触摸事件注入（需要 gpio7 EINT -> GIC 0x58）为下一步。
  */
 #define GTP_ADDR 0x5d
+/* ---- SYR827 / SYR828（Silergy DC-DC，i2c 0x40/0x41）--------------------
+ * P817 的 vdd_arm / vdd_gpu 由这两颗提供（act8846 只有 vdd_logic 等）。
+ * 不建模时：syr82x probe -11 → vdd_arm/vdd_gpu 缺失 → DVFS 表有洞 →
+ * rkpm_save_setting 里函数指针跳到数据区 → UNDEF 死循环（PC=0xc0021c40）。
+ */
+#define SYR827_ADDR 0x40
+#define SYR828_ADDR 0x41
+static uint8_t syr_regs[2][256];
+static uint8_t syr_ptr[2];
 static uint16_t gtp_ptr;
 static uint8_t  gtp_cfg[192];
 
@@ -580,6 +589,18 @@ static void gtp_fifo_read(void *opaque)
         } else if (!strncmp(line, "up", 2)) {
             gtp_touch_set(0, 0, 0);
         }
+    }
+}
+
+static void syr_reset(void)
+{
+    int i;
+
+    for (i = 0; i < 2; i++) {
+        memset(syr_regs[i], 0x40, sizeof(syr_regs[i]));  /* 全部填 0x40：
+                                                          * 驱动先读 reg 0x03 做 ID 校验 */
+        syr_regs[i][0x00] = 0x20;   /* VSEL：合法档位 */
+        syr_ptr[i] = 0;
     }
 }
 
@@ -710,6 +731,19 @@ static void rk3288_i2c_do_tx(RK3288I2C *s)
         s->ipd |= I2C_IPD_MBTF;
         return;
     }
+    if (addr == SYR827_ADDR || addr == SYR828_ADDR) {
+        unsigned k = addr - SYR827_ADDR;
+        unsigned off = (i2c_tx_byte(s, 0) == (uint8_t)(addr << 1)) ? 1 : 0;
+
+        if (n > off) {
+            syr_ptr[k] = i2c_tx_byte(s, off);
+        }
+        for (i = off + 1; i < n; i++) {
+            syr_regs[k][(syr_ptr[k] + i - off - 1) & 0xff] = i2c_tx_byte(s, i);
+        }
+        s->ipd |= I2C_IPD_MBTF;
+        return;
+    }
     if (addr != ACT8846_ADDR) {
         s->ipd |= I2C_IPD_NAKRCV;
         return;
@@ -753,6 +787,29 @@ static void rk3288_i2c_do_rx(RK3288I2C *s)
             i2c_set_rx_byte(s, i, gtp_read_reg((uint16_t)(base16 + i)));
         }
         gtp_ptr = (uint16_t)(base16 + n);
+        s->ipd |= I2C_IPD_MBRF;
+        return;
+    }
+    if (addr == SYR827_ADDR || addr == SYR828_ADDR) {
+        unsigned k = addr - SYR827_ADDR;
+        unsigned off = (i2c_tx_byte(s, 0) == (uint8_t)(addr << 1)) ? 1 : 0;
+
+        if (n > off) {
+            syr_ptr[k] = i2c_tx_byte(s, off);
+        }
+        for (i = off + 1; i < n; i++) {
+            syr_regs[k][(syr_ptr[k] + i - off - 1) & 0xff] = i2c_tx_byte(s, i);
+        }
+        s->ipd |= I2C_IPD_MBTF;
+        return;
+    }
+    if (addr == SYR827_ADDR || addr == SYR828_ADDR) {
+        unsigned k = addr - SYR827_ADDR;
+        unsigned base8 = (unsigned)(s->mrxraddr & 0xff);
+
+        for (i = 0; i < n; i++) {
+            i2c_set_rx_byte(s, i, syr_regs[k][(base8 + i) & 0xff]);
+        }
         s->ipd |= I2C_IPD_MBRF;
         return;
     }
@@ -1363,6 +1420,13 @@ static void rk3288_init(MachineState *machine)
     }
     rk3288_saradc_irq = pic[RK3288_SARADC_IRQ];   /* after pic[] is filled */
 
+    /* gpio0 bank（0xff750000）：act8846 的 gpios 引用 <&gpio0 0xa ...>，
+     * 缺这个 bank 时 pinctrl 不注册 gpio0 → act8846 probe 报
+     * "Failed to request gpio -2" → 12 个 regulator 全部缺失 → DVFS 崩
+     * （实测 rkpm_save_setting 死循环，PC=0xc0021c40）。
+     * bank0 与 gpio7 寄存器布局一致，先复用同一套 ops（无独立中断需求）。 */
+    rk3288_add_io(sysmem, 0xff750000ULL, 0x100, &rk3288_gpio7_ops, "rk3288-gpio0");
+
     /* gpio7 bank：只实现触摸需要的寄存器 + EINT -> GIC SPI 0x58 */
     rk3288_add_io(sysmem, GPIO7_BASE, 0x100, &rk3288_gpio7_ops, "rk3288-gpio7");
     gpio7_irq_line = pic[GPIO7_IRQ_SPI];
@@ -1396,6 +1460,7 @@ static void rk3288_init(MachineState *machine)
     /* 6x RK I2C + ACT8846（i2c-0 @0x5a）。IRQ 必须真接上：
      * 驱动是 wait_event_timeout(is_busy==0)，不拉中断就只会超时 -110。 */
     act8846_reset();
+    syr_reset();
     gtp_reset();
     for (n = 0; n < RK3288_I2C_NR; n++) {
         MemoryRegion *r = g_new(MemoryRegion, 1);

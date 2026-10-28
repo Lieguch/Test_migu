@@ -654,3 +654,29 @@ vmalloc : 0xe0800000 - 0xff000000   ( 488 MB)
   ① 无 PMIC（act8846 的 regulator）→ 只能临时关 `clk_ddr` DVFS；
   ② 无 VPU/HEVC/IEP/ISP/GPU 模型 → 只能 disable 这些节点；
   ③ 无 HDMI/MIPI/LVDS/EDP → 同上。
+
+### ★ 第九步（同日）：真机化后 10 s 卡死定性 = DVFS 表有洞导致 UNDEF 死循环
+
+**现象**：真机化配置（无 cmdline + initrd@0x62000000 + `p817_dev.dtb`）稳定停在 10.39 s。
+QMP 连采 3 次：`R15=R14` 恒定、`PSR=svc32`、寄存器全不变 ⇒ 紧循环。
+
+**反汇编定性**：`0xc0021c40` 在内存 dump（`kimg.bin`）里是 **数据**（`0xff720000`），
+不是指令 ⇒ CPU 在数据区取指 ⇒ **未定义指令异常自循环**（函数指针被调到了数据地址）。
+
+**根因链**：
+1. `act8846` 已能 probe（补了 gpio0 bank 后 `pmic_hold=1`），注册出
+   `act_dcdc1 / vccio / vdd_logic / act_dcdc4 / vccio_sd / act_ldo2..6`；
+2. **`vdd_arm` / `vdd_gpu` 不在 act8846 里** —— 该板由 **SYR827(0x40) / SYR828(0x41)** 提供；
+3. 我们的 I2C 模型对 0x40/0x41 不应答 ⇒ `syr82x: probe ... failed with error -110`；
+4. `DVFS ERR: vd(vd_arm)/vd(vd_gpu) can't get regulator` ×2 ⇒ DVFS 表有空项 ⇒
+   `rkpm_save_setting` 遍历时调到野指针 ⇒ UNDEF 死循环。
+
+**已做**：新增 syr827/syr828 从设备（8 位寄存器文件、VSEL 初值 0x20）。
+**仍失败**：驱动只读 `reg 0x03` 做 ID 校验，我们应答后仍报 `-110 (ETIMEDOUT)`，
+说明**该传输没有按驱动期望完成**（同为 I2C-0 的 act8846 正常，故差异在 syr82x 的时序/位序）。
+
+**下一步（明确）**
+1. 对比 act8846（正常）与 syr82x（超时）的完整 I2C 序列：TX 字节、MRXRADDR、CON、IPD 写读；
+   重点看 syr82x 是否用 `mode=0`（寄存器来自上次 TX）而我们只实现了 `mode=1`。
+2. 查 syr82x 驱动源码的 ID 校验寄存器与期望值（`reg 0x03`，期望值待确认）。
+3. 通了之后：`vdd_arm/vdd_gpu` 注册 → DVFS 无洞 → 10 s 卡死应消失 → 再往 `init first stage` 推进。

@@ -268,3 +268,41 @@ $Q -M rk3288 -smp 1 -m 2048 -kernel t78_stage/stock_zImage -initrd t78_stage/sto
   -append "console=ttyS2,115200 vmalloc=496M mem=2048M clk_ignore_unused cpufreq=disabled loglevel=7" \
   -display none -serial file:logs/stock_ok.log -monitor none -no-reboot -dtb d5.dtb
 ```
+
+---
+
+## 2026-10-28 四次实测：TWRP 2.8.7 ramdisk 进环，卡在 userspace on boot 未触发
+
+### 素材（本地已就位，无需构建/CI）
+`D:/output/pad/work/hybrid/twrp287_idfix_recovery.img`（12 877 824 B，与 GitHub Release
+`stage2-44-*` 同尺寸）。解出：kernel = **stock 同一个**（sha `e38ae4c4…`），ramdisk 6 061 616 B。
+ramdisk 属性实测：`sepolicy` **version 26**（≤28 ✓）、4.4 代 init、`/sbin/recovery` 447 988 B、
+`sbin/recovery` 内含 `Starting TWRP %s-%s`。
+
+### 逐项结果
+| 变体 | 关键观测 |
+|---|---|
+| 原 ramdisk + v26 策略 + d5.dtb | `SELinux: Loaded policy from /sepolicy` ✓，但
+`init: cannot setexeccon('u:r:recovery:s0'): Invalid argument`；无 `Starting TWRP`；100 s 不崩 |
+| 去 sepolicy + `androidboot.selinux=disabled` | setexeccon 消失；仍无 `Starting TWRP`；100 s 不崩 |
+| 补 `console`/`class core`、`on boot: start recovery` | 同上，仍无输出 |
+| 用 `/sbin/sh -c "/sbin/recovery; echo RECOVERY_RC=$?"` 包一层 | **连 shell 输出都没有** |
+
+⇒ 结论：**`on boot` 触发器根本没走到**（若走到，包一层的 shell 至少会回显）。
+早前 stock 4.4 ramdisk 能打印 `# Starting recovery on ...`，说明同一内核 + 同一 harness 下
+userspace 通路是通的，差异在 TWRP ramdisk 的 init 启动路径（触发条件/依赖设备节点）。
+
+### 已排除
+- 不是 SELinux（去掉策略后仍无输出，且无 setexeccon 报错）
+- 不是内核崩（100 s 无 oops/panic；`fb0` 已注册：`graphics fb0: rockchip framebuffer registerd:fb0`）
+- 不是缺 `/sbin/recovery`（存在且可执行）
+- 不是 kernel/DTB 配置（stock ramdisk 同配方可跑 recovery）
+
+### 下一步（最有信息量）
+1. 在 TWRP ramdisk 的 `init.rc` 的 `on early-init` / `on init` / `on boot` 各插一行
+   `write /dev/kmsg "MARK <阶段>"`，确认 init 究竟停在哪一步（大概率
+   `wait_for_coldboot_done()` 或 `property_service` 初始化）。
+2. 对照 stock init.rc：stock 把 `service recovery` 直接写在**主 init.rc**（第 57 行）且
+   `on boot` 块简单；TWRP 依赖 `import /init.recovery.service.rc`。若 import 失败/顺序问题，
+   可把 service 定义直接搬进主 init.rc 验证。
+3. 拿到触发点后再看 TWRP 自身的 minui/fb 依赖（Route A 显示相关）。

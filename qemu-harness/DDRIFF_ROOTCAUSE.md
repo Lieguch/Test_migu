@@ -572,3 +572,32 @@ B: ABS=2650000 0   ← 置位的是 bit16/18/21/22/25
 
 **下一步**：用 `dd` 抓到的 128 B 原始事件解出 `type/code/value` 序列（需在 ramdisk 里补 `od`，
 或把 `ev.bin` 通过 kmsg 分段打印），据此判断是 type A/B 还是坐标问题。
+
+### ★ 触摸建模第七步（同日）：排除坐标因素，锁定 TWRP 侧不消费
+
+**坐标扫描（4 个点，每次注入后比帧缓冲）**
+| 注入 `tap x y` | 帧缓冲对比 |
+|---|---|
+| `187 1616`（瞄准「保持只读」） | SAME |
+| `1012 1616`（瞄准「选择语言」） | SAME |
+| `600 960`（屏幕中心） | SAME |
+| `960 600`（另一象限） | SAME |
+
+⇒ **不是坐标换算问题**：四个方向都没反应。
+
+**进程侧**
+```
+PID 107 recovery / PID 112 recovery   （两个实例，说明 init 至少重启过一次）
+PID 101 ueventd / 106 healthd / 109 adbd
+```
+（`ls -l /proc/*/fd | grep event` 在 busybox 下没产出，探针本身不可靠，不能据此断言"没打开"。）
+
+**结论**：GTP → 驱动 → input 子系统这一段已实测打通（`ev.bin` 128 B），
+剩下的是 **TWRP minui 是否把它当作触摸设备**。下一步应直接看 minui 的判定条件：
+- TWRP 3.1.1 `minui/events.cpp`：`ev_init()` 扫描 `/dev/input/event*`，
+  以 `test_bit(ABS_MT_POSITION_X)` 判定触摸设备；type A 需要 `SYN_MT_REPORT`，
+  type B 需要 `ABS_MT_SLOT`+`ABS_MT_TRACKING_ID`。
+- 我们的设备能力位（`ABS=2650000 0`）按内核打印顺序（高字在前）解出为
+  bit48/50/53/54/57 = `MT_TOUCH_MAJOR/MT_WIDTH_MAJOR/MT_POSITION_X/MT_POSITION_Y/MT_TRACKING_ID`
+  ⇒ **有 POSITION_X/Y 与 TRACKING_ID，没有 MT_SLOT** ⇒ 属 type A 变体。
+- 若 minui 走 type B 分支（要求 SLOT），就会忽略该设备 —— 这与"事件存在但界面不动"一致。

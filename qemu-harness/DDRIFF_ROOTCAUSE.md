@@ -508,3 +508,36 @@ B: ABS=2650000 0
   但脚本里 `cat` 立即失败（`EV_BYTES=` 为空，20 ms 就返回）⇒ **这是探针工具问题，不能当成"无事件"的证据**。
 - 改进方向：用 `dd if=/dev/input/event1 bs=16 count=N` + 显式 stderr 重定向，先确认 `ls /dev/input/` 可见，
   再判断事件流；或直接在 TWRP 侧开 `TW_DEBUG_INPUT`（若有）看 minui 是否收到 EV_ABS。
+
+### ★ 触摸建模第五步（同日）：纠正两个误判 + 定位真正剩余点
+
+**误判 1 纠正：`/dev/input/` 节点是存在的**
+```
+$ ls -l /dev/input
+crw-rw---- root input 13, 64 event0
+crw-rw---- root input 13, 65 event1     ← goodix-ts
+crw-rw---- root input 13, 66 event2
+```
+（上一轮"`ls` 无输出"是我探针写法问题：`ls | while read` 在某些 busybox 下不产出，不是节点缺失。）
+
+**误判 2 纠正：驱动一次读 10 字节**（`RX n=10 mrxraddr=03004e81`），状态与坐标同一传输，
+随后写 `0x814E=0` 清 buffer —— 一轮完整握手已走完。所以"驱动没取坐标"的结论作废。
+
+**真正可疑点：ABS 能力位里没有 `ABS_MT_POSITION_X/Y`**
+```
+N: Name="goodix-ts"
+H: Handlers=event1 cpufreq
+B: EV=b            (SYN|KEY|ABS)
+B: ABS=2650000 0   ← 置位的是 bit16/18/21/22/25
+```
+`ABS_MT_POSITION_X = 0x35(53)`、`ABS_MT_POSITION_Y = 0x36(54)`、`ABS_MT_SLOT = 0x2f(47)`
+都在**高 32 位**（第二组数字），而它是 **0**；`ABS_X=0 / ABS_Y=1` 也没置位。
+⇒ 该驱动注册的轴集合不含 TWRP minui 需要的触摸轴 ⇒ TWRP 不会把 event1 当触摸设备。
+
+**下一步（明确）**
+1. 用 `vmlinux.elf` 里的符号 + 反汇编确认 gt9xx 的 `input_set_abs_params` 究竟注册了哪些码
+   （或直接看驱动源码 `goodix_ts_probe`）。
+2. 若驱动只注册了 `ABS_MT_*` 的旧编号，需在 QEMU 侧/驱动侧补齐；若注册正常，
+   则问题在 TWRP minui 的设备筛选条件（`TW_` 宏 / `ABS_MT_POSITION_X` 判定）。
+3. 验证手段：`dd if=/dev/input/event1 bs=16 count=64` 在注入期间抓原始事件，
+   确认 `type/code/value` 序列（此前 dd 探针因脚本问题未取到，节点已确认可读）。

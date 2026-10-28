@@ -306,3 +306,53 @@ userspace 通路是通的，差异在 TWRP ramdisk 的 init 启动路径（触�
    `on boot` 块简单；TWRP 依赖 `import /init.recovery.service.rc`。若 import 失败/顺序问题，
    可把 service 定义直接搬进主 init.rc 验证。
 3. 拿到触发点后再看 TWRP 自身的 minui/fb 依赖（Route A 显示相关）。
+
+---
+
+## 2026-10-28 五次实测 ★ TWRP 主程序在 QEMU 中跑通（3.1.1 / zh_CN / UI 主题加载完成）
+
+### 结论
+**TWRP 已经在 QEMU(rk3288) 里跑起来**，`logs/m6.log`（123 681 B）关键行：
+```
+Starting TWRP 3.1.1-0-c75c8a2e on Thu Jan  1 00:00:23 1970   (pid 112)
+I:=> hardware id from cpuinfo: 'Rockchip RK3288 (Flattened Devi'
+I:LANG: zh_CN
+Starting the UI...
+Skipping adf graphics -- not present in build tree
+Skipping drm graphics -- not present in build tree
+fb0 reports (possibly inaccurate):
+  vi.bits_per_pixel = 16   red 11/5  green 5/6  blue 0/5
+setting GGL_PIXEL_FORMAT_RGB_565 ; double buffered
+framebuffer: 3 (1920 x 1200)
+Using fbdev graphics.
+I:Loading package: splash (/twres/splash.xml)
+I:Scaling theme width 1.777778x and height 0.625000x
+I:Loading resources... variables... mouse cursor... pages...
+I:Processing '/data' '/boot' '/recovery' '/backup' ...
+I:Using automatic handling for /data/media emulated storage device.
+I:Backup folder set to '/data/media/TWRP/BACKUPS/0000000000000000'
+Updating partition details...
+Failed to mount '/data' / '/cache' / '/system' (Invalid argument)   ← 无真实块设备，预期
+```
+
+### ★ 之前「看不到输出」的真相（重要纠错）
+TWRP 的 stdout **不接控制台**，它只写 `/tmp/recovery.log`。
+先前用 `grep "Starting TWRP" 串口日志` 得到 0 命中，被我误判成「init 没触发 / 服务没起」。
+真正判定方法：在 ramdisk 里加一个探针服务，逐行 `echo "$line" > /dev/kmsg` 把
+`/tmp/recovery.log` 倒出来（`cat > /dev/kmsg` 会因单次写入过大报 EINVAL）。
+
+### 三个必须项（缺任一即失败）
+1. `-append` 必须含 `vmalloc=496M mem=2048M`（否则早期 `early_alloc_aligned()` 踩未映射线性区）。
+2. DTB 必须关 DDR 变频：`/dvfs/vd_logic/pd_ddr/clk_ddr status=disabled`（否则 5.4 s `ddrfreqd` oops）。
+3. ramdisk 去掉 `/sepolicy` + `androidboot.selinux=disabled`
+   （v26 策略能加载，但 `init: cannot setexeccon('u:r:recovery:s0')` EINVAL）。
+
+### 素材与事实修正
+- 文件名叫 `twrp287_idfix_recovery.img`，但镜像内 TWRP 自报 **3.1.1-0-c75c8a2e**（不是 2.8.7）。
+- kernel 与 stock 同一个 sha `e38ae4c4…`（6 791 568 B）；ramdisk 6 061 616 B。
+- 脚本：`qemu-harness/run_twrp_qemu.sh`（本配方一键复跑）。
+
+### 下一步
+- 显示验证：QEMU 加 `-display vnc=:0` 或 `-device VGA` 截屏，确认 splash/主菜单实际画面。
+- 交互验证：给 QEMU 接 evdev/鼠标，验证触摸映射（真实目的是绕开坏电源键）。
+- 收尾：把本配方回灌 `HANDOFF.md` 与 build 流程，作为「TWRP 可跑」的验收基线。

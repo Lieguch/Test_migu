@@ -792,24 +792,13 @@ static void rk3288_i2c_do_rx(RK3288I2C *s)
     }
     if (addr == SYR827_ADDR || addr == SYR828_ADDR) {
         unsigned k = addr - SYR827_ADDR;
-        unsigned off = (i2c_tx_byte(s, 0) == (uint8_t)(addr << 1)) ? 1 : 0;
-
-        if (n > off) {
-            syr_ptr[k] = i2c_tx_byte(s, off);
-        }
-        for (i = off + 1; i < n; i++) {
-            syr_regs[k][(syr_ptr[k] + i - off - 1) & 0xff] = i2c_tx_byte(s, i);
-        }
-        s->ipd |= I2C_IPD_MBTF;
-        return;
-    }
-    if (addr == SYR827_ADDR || addr == SYR828_ADDR) {
-        unsigned k = addr - SYR827_ADDR;
-        unsigned base8 = (unsigned)(s->mrxraddr & 0xff);
+        unsigned i2c_mode = (s->con >> 1) & 3;
+        unsigned i2c_base = (i2c_mode == 1 || i2c_mode == 3) ? (s->mrxraddr & 0xff) : syr_ptr[k];
 
         for (i = 0; i < n; i++) {
-            i2c_set_rx_byte(s, i, syr_regs[k][(base8 + i) & 0xff]);
+            i2c_set_rx_byte(s, i, syr_regs[k][(i2c_base + i) & 0xff]);
         }
+        syr_ptr[k] = (i2c_base + n) & 0xff;
         s->ipd |= I2C_IPD_MBRF;
         return;
     }
@@ -858,6 +847,7 @@ static void rk3288_i2c_write(void *opaque, hwaddr off, uint64_t val, unsigned si
         s->txw[(off - 0x100) / 4] = val;
         return;
     }
+    fprintf(stderr, "[i2c] WREG %03x = %08x\n", (unsigned)off, (unsigned)val);
     switch (off) {
     case 0x000:
         s->con = val;
@@ -1094,12 +1084,24 @@ static uint64_t rk3288_pmu_read(void *opaque, hwaddr off, unsigned size)
     switch (off) {
     case 0x9c: v = RK3288_PMU_SYS2; break;
     case 0x08: v = rk3288_pmu_pwrdn_con; break;
-    /* PWRDN_ST: per-domain power status.  Measured 2026-10-22 (t65): the
-     * power-domain handshake helper (0xc0021bfc) wrote PWRDN_CON = 0x80
-     * (bit7) and polled PWRDN_ST for the SAME bit (mask 0x80), i.e. the
-     * ST ack bit is 1:1 with the CON enable bit (RK3288 TRM:
-     * pd_vio_pwr_st = 1<<7 == the vio pwren bit).  Echo con directly. */
-    case 0x0c: v = rk3288_pmu_pwrdn_con; break;
+    /* PWRDN_ST: 逐域把 CON 位映射到 ST 位。
+     * 内核两张表（arch/arm/mach-rockchip/rk3288.c:174-186 / 234-246）：
+     *   pmu_st_map: CPU0-3=0..3 BUS=5 PERI=6 VIO=7 VIDEO=8 GPU=9 HEVC=10 SCU=11
+     *   pmu_pd_map: 同上，唯一例外 PD_HEVC=14
+     * ⇒ 除 HEVC 外 ST/CON 同位；HEVC 必须 CON bit14 -> ST bit10。
+     * 旧模型直接回显 CON，导致 PD_HEVC 断电轮询（ST bit10）永不成立：
+     * 实测 PC=0xc001db78 R0=9(PD_HEVC) R1=0 R2=0x400；
+     * boot_v1 0.637s / boot_v2 3.258s 均卡死于此。 */
+    case 0x0c: {
+        uint32_t con = rk3288_pmu_pwrdn_con;
+        uint32_t st  = con & ~(1u << 10);
+
+        if (con & (1u << 14)) {
+            st |= (1u << 10);
+        }
+        v = st;
+        break;
+    }
     case 0x10: v = rk3288_pmu_idle_req; break;
     /* IDLE_ST carries TWO groups (ddr_rk32.c L88-96):
      *   bits  0- 9: per-domain idle STATUS (same positions as IDLE_REQ)
@@ -1429,6 +1431,17 @@ static void rk3288_init(MachineState *machine)
 
     /* gpio7 bank：只实现触摸需要的寄存器 + EINT -> GIC SPI 0x58 */
     rk3288_add_io(sysmem, GPIO7_BASE, 0x100, &rk3288_gpio7_ops, "rk3288-gpio7");
+
+    /* gpio8 bank (0xff7f0000)：crypto 等设备引用的 gpio，同布局 */
+    rk3288_add_io(sysmem, 0xff7f0000ULL, 0x100, &rk3288_gpio7_ops, "rk3288-gpio8");
+
+    /* gpio15 bank (0xff7f2000)：同上 */
+    rk3288_add_io(sysmem, 0xff7f2000ULL, 0x100, &rk3288_gpio7_ops, "rk3288-gpio15");
+
+    /* PMU (0xff730000)：DVFS init 读 0x10/0x14 做 idle handshake。
+     * 之前返回 0 导致死循环；现在按实测：IDLE_ST = IDLE_REQ | (IDLE_REQ<<16)。 */
+    rk3288_add_io(sysmem, RK3288_PMU_BASE, 0x1000, &rk3288_pmu_ops, "rk3288-pmu");
+
     gpio7_irq_line = pic[GPIO7_IRQ_SPI];
     gpio7_int_mask = 0x00000000u;      /* ★ 1=masked；复位应为全 0（不屏蔽），
                                        *   驱动只写 INT_EN，不会解 INT_MASK */

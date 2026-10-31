@@ -271,35 +271,69 @@ static const MemoryRegionOps rk3288_catchall_ops = {
 #define RK3288_GRF_BASE 0xff770000ULL
 #define RK3288_GRF_SIZE 0x00001000ULL
 
-/* A region whose reads answer 0xFFFFFFFF (every lock/status bit set) and
- * whose writes are dropped.  Used for CRU + GRF so that the RK clock
- * driver's pll_wait_lock() polling completes instead of deadlocking. */
-static uint64_t rk3288_allones_read(void *opaque, hwaddr off, unsigned size)
+/* CRU / GRF as register files (writes stored, reads return what was written),
+ * NOT as "read 0xFFFFFFFF".  The old all-ones stub made every clock-gate state,
+ * reset state and pinctrl mux/pull/drv bit read back as 1 — a whole 4 KiB of
+ * fabricated state (audit S1-A).
+ *
+ * The one status the kernel genuinely polls is the PLL lock bit, and the DTB
+ * names it explicitly (p817.dts pll_cons, status-reg):
+ *     aPLL <0x284 6>  dPLL <0x284 5>  cPLL <0x284 7>  gPLL <0x284 8>  nPLL <0x284 9>
+ * clk-pll.c:180 waits on grf_readl(status_offset) & (1 << status_shift), so GRF
+ * offset 0x284 reports those five bits as locked.  Everything else is 0 until
+ * the guest writes it. */
+static void rk3288_hit_note(int region, hwaddr off, const char *who, uint32_t val);
+
+static uint32_t rk3288_cru_regs[RK3288_CRU_SIZE / 4];
+static uint32_t rk3288_grf_regs[RK3288_GRF_SIZE / 4];
+
+#define RK3288_GRF_PLL_STATUS 0x284u
+#define RK3288_GRF_PLL_LOCKED 0x000003e0u   /* bits 5..9 = dPLL,cPLL,aPLL,gPLL,nPLL */
+
+static uint64_t rk3288_cru_read(void *opaque, hwaddr off, unsigned size)
 {
-    return 0xFFFFFFFF;
+    uint32_t v = (off / 4 < RK3288_CRU_SIZE / 4) ? rk3288_cru_regs[off / 4] : 0;
+
+    rk3288_hit_note(4, off, "cru", v);
+    return v;
 }
 
-static void rk3288_allones_write(void *opaque, hwaddr off, uint64_t val,
-                                 unsigned size)
+static void rk3288_cru_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 {
-    /* dropped */
+    if (off / 4 < RK3288_CRU_SIZE / 4) {
+        rk3288_cru_regs[off / 4] = val;
+    }
 }
 
-static const MemoryRegionOps rk3288_allones_ops = {
-    .read = rk3288_allones_read,
-    .write = rk3288_allones_write,
-    .valid.min_access_size = 1,
-    .valid.max_access_size = 4,
+static uint64_t rk3288_grf_read(void *opaque, hwaddr off, unsigned size)
+{
+    uint32_t v = (off / 4 < RK3288_GRF_SIZE / 4) ? rk3288_grf_regs[off / 4] : 0;
+
+    if (off == RK3288_GRF_PLL_STATUS) {
+        v |= RK3288_GRF_PLL_LOCKED;
+    }
+    rk3288_hit_note(5, off, "grf", v);
+    return v;
+}
+
+static void rk3288_grf_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
+{
+    if (off / 4 < RK3288_GRF_SIZE / 4) {
+        rk3288_grf_regs[off / 4] = val;
+    }
+}
+
+static const MemoryRegionOps rk3288_cru_ops = {
+    .read = rk3288_cru_read, .write = rk3288_cru_write,
+    .valid.min_access_size = 1, .valid.max_access_size = 4,
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
-static void rk3288_add_allones(MemoryRegion *sysmem, hwaddr base,
-                               hwaddr size, const char *name)
-{
-    MemoryRegion *r = g_new(MemoryRegion, 1);
-    memory_region_init_io(r, NULL, &rk3288_allones_ops, NULL, name, size);
-    memory_region_add_subregion(sysmem, base, r);
-}
+static const MemoryRegionOps rk3288_grf_ops = {
+    .read = rk3288_grf_read, .write = rk3288_grf_write,
+    .valid.min_access_size = 1, .valid.max_access_size = 4,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
 
 
 /* =========================================================================
@@ -404,7 +438,7 @@ static void rk3288_add_allones(MemoryRegion *sysmem, hwaddr base,
 
 /* one-shot per-word hit log, per region: tells us what the guest really needs */
 #define RK3288_LOG_WORDS 0x4000
-static uint8_t rk3288_hit[4][RK3288_LOG_WORDS / 32];
+static uint8_t rk3288_hit[6][RK3288_LOG_WORDS / 32];
 
 static void rk3288_hit_note(int region, hwaddr off, const char *who, uint32_t val)
 {
@@ -1325,8 +1359,8 @@ static void rk3288_init(MachineState *machine)
      * virtual 0xfed10000, i.e. exactly the range the disassembly showed.
      * Reads of 0 therefore make the wait always time out.  The CRU gets the
      * same treatment for the same reason (any lock/mode bit read there). */
-    rk3288_add_allones(sysmem, RK3288_CRU_BASE, RK3288_CRU_SIZE, "rk3288-cru");
-    rk3288_add_allones(sysmem, RK3288_GRF_BASE, RK3288_GRF_SIZE, "rk3288-grf");
+    rk3288_add_io(sysmem, RK3288_CRU_BASE, RK3288_CRU_SIZE, &rk3288_cru_ops, "rk3288-cru");
+    rk3288_add_io(sysmem, RK3288_GRF_BASE, RK3288_GRF_SIZE, &rk3288_grf_ops, "rk3288-grf");
 
     /* DDR / PMU / SGRF / MSCH — see the derivation block above.
      * Without these, ddr_get_datatraing_addr() dereferences a NULL pMSCH_Reg

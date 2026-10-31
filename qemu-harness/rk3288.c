@@ -1267,6 +1267,16 @@ static uint64_t rk3288_ddr_read(void *opaque, hwaddr off, unsigned size)
     hwaddr  rel = off & 0xfff;
     uint32_t v;
 
+    /* RK3288_DDR_WIDE: the guest issues 64-bit loads/stores here; split them
+     * instead of letting QEMU reject the access size (which surfaces as an
+     * external abort -> abort-handler recursion). */
+    if (size == 8) {
+        uint64_t lo = rk3288_ddr_read(opaque, off, 4);
+        uint64_t hi = rk3288_ddr_read(opaque, off + 4, 4);
+
+        return lo | (hi << 32);
+    }
+
     if (blk & 1) {
         v = rk3288_phy_read(rel);       /* PUBL / PHY */
     } else if (rel == 0x08) {
@@ -1286,6 +1296,12 @@ static void rk3288_ddr_write(void *opaque, hwaddr off, uint64_t val, unsigned si
 {
     unsigned blk = off >> 12;
 
+    if (size == 8) {
+        rk3288_ddr_write(opaque, off, val & 0xffffffffu, 4);
+        rk3288_ddr_write(opaque, off + 4, val >> 32, 4);
+        return;
+    }
+
     if (!(blk & 1) && (off & 0xfff) == 0x04) {
         rk3288_pctl_cmd(blk >> 1, val);   /* SCTL：驱动状态机 */
     }
@@ -1294,7 +1310,7 @@ static void rk3288_ddr_write(void *opaque, hwaddr off, uint64_t val, unsigned si
 
 static const MemoryRegionOps rk3288_ddr_ops = {
     .read = rk3288_ddr_read, .write = rk3288_ddr_write,
-    .valid.min_access_size = 1, .valid.max_access_size = 4,
+    .valid.min_access_size = 1, .valid.max_access_size = 8,
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
@@ -1370,6 +1386,12 @@ static void rk3288_init(MachineState *machine)
     rk3288_add_io(sysmem, RK3288_SGRF_ALT,  0x1000, &rk3288_sgrf_ops, "rk3288-sgrf-alt");
     rk3288_add_io(sysmem, RK3288_MSCH_BASE, 0x1000, &rk3288_msch_ops, "rk3288-msch");
     rk3288_add_io(sysmem, RK3288_DDR_BASE,  RK3288_DDR_SIZE, &rk3288_ddr_ops, "rk3288-ddr");
+    /* 0xfedd0000 = RK_DDR_VIRT.  The CI kernel maps it to phys 0xff610000, but the
+     * vendor kernel reaches a *physical* 0xfedd0000 (DFSR 0x808 / DFAR 0xfedd00c0,
+     * a write) which sat below the 0xff000000 catch-all and above RAM, i.e. was
+     * unmapped -> external abort -> abort handler recursion.  Back it. */
+    rk3288_add_io(sysmem, 0xfedd0000ULL, RK3288_DDR_SIZE, &rk3288_ddr_ops,
+                  "rk3288-ddr-alias");
     /* ★ 补丁 1 的区域默认关闭（2026-10-28 实测证据）：
      * 该内核用默认 loader_start 装到 0x00008000，自解压后映像约 13 MB
      * （字符串区实测在 0x00d165xx），正好覆盖 0x000d0000。若在此注册
